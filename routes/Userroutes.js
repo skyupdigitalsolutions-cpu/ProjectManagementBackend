@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const { getAllUsers, getUserById, updateUser, deleteUser, updateRole, getUserStats } = require("../controllers/UserController");
+const { getAllUsers, getUserById, updateUser, deleteUser, updateRole, getUserStats } = require("../controllers/userController");
 const { protect, authorise } = require("../middleware/authMiddleware");
 
 // GET    /api/v1/users/stats         — Admin only: counts by role, status, department

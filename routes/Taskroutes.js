@@ -9,7 +9,7 @@ const {
   deleteTask,
   bulkUpdateStatus,
   getTaskStats,
-} = require("../controllers/TaskController");
+} = require("../controllers/taskController");
 const { protect, authorise } = require("../middleware/authMiddleware");
 
 // GET    /api/v1/tasks/stats          — Admin/Manager: counts per status (?project_id)
