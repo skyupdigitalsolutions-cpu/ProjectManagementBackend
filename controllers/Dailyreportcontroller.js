@@ -1,4 +1,4 @@
-const DailyReport = require("../models/dailyReport");
+const Dailyreport = require("../models/Dailyreport");
 
 // Helper: normalise a date to midnight local time
 const toMidnight = (d) => {
@@ -19,7 +19,7 @@ const submitReport = async (req, res) => {
 
     const today = toMidnight(new Date());
 
-    const report = await DailyReport.findOneAndUpdate(
+    const report = await Dailyreport.findOneAndUpdate(
       { user_id: req.user._id, date: today },
       {
         user_id: req.user._id,
@@ -61,8 +61,8 @@ const getMyReports = async (req, res) => {
 
     const skip = (Number(page) - 1) * Number(limit);
     const [reports, total] = await Promise.all([
-      DailyReport.find(filter).sort({ date: -1 }).skip(skip).limit(Number(limit)),
-      DailyReport.countDocuments(filter),
+      Dailyreport.find(filter).sort({ date: -1 }).skip(skip).limit(Number(limit)),
+      Dailyreport.countDocuments(filter),
     ]);
 
     return res.status(200).json({
@@ -84,7 +84,7 @@ const getMyReports = async (req, res) => {
 // Employee: get own today's report (if any)
 const getTodayReport = async (req, res) => {
   try {
-    const report = await DailyReport.findOne({
+    const report = await Dailyreport.findOne({
       user_id: req.user._id,
       date: toMidnight(new Date()),
     });
@@ -110,12 +110,12 @@ const getAllReports = async (req, res) => {
 
     const skip = (Number(page) - 1) * Number(limit);
     const [reports, total] = await Promise.all([
-      DailyReport.find(filter)
+      Dailyreport.find(filter)
         .populate("user_id", "name email designation department")
         .sort({ date: -1, createdAt: -1 })
         .skip(skip)
         .limit(Number(limit)),
-      DailyReport.countDocuments(filter),
+      Dailyreport.countDocuments(filter),
     ]);
 
     return res.status(200).json({
@@ -148,12 +148,12 @@ const getUserReports = async (req, res) => {
 
     const skip = (Number(page) - 1) * Number(limit);
     const [reports, total] = await Promise.all([
-      DailyReport.find(filter)
+      Dailyreport.find(filter)
         .populate("user_id", "name email designation department")
         .sort({ date: -1 })
         .skip(skip)
         .limit(Number(limit)),
-      DailyReport.countDocuments(filter),
+      Dailyreport.countDocuments(filter),
     ]);
 
     return res.status(200).json({
@@ -175,7 +175,7 @@ const getUserReports = async (req, res) => {
 // Employee: delete own report; Admin: delete any
 const deleteReport = async (req, res) => {
   try {
-    const report = await DailyReport.findById(req.params.id);
+    const report = await Dailyreport.findById(req.params.id);
     if (!report)
       return res.status(404).json({ success: false, message: "Report not found" });
 
