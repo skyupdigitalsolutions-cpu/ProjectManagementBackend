@@ -5,7 +5,7 @@ const NotificationSchema = mongoose.Schema(
     user_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true,               // who receives the notification
+      required: true,               // who receives the notification (or sender for outbox copy)
     },
     sender_id: {
       type: mongoose.Schema.Types.ObjectId,
@@ -15,43 +15,52 @@ const NotificationSchema = mongoose.Schema(
     message: {
       type: String,
       required: true,
-      trim: true,                   // e.g. "You have been assigned a new task"
+      trim: true,
     },
     type: {
       type: String,
       enum: [
-        "task_assigned",// a task was assigned to the user
-        "task_updated",// task status/priority changed
-        "task_completed",// task marked as done
-        "project_assigned",// user added to a project
-        "project_updated",// project details changed
-        "member_added",// new member joined your project
-        "member_removed",// member removed from project
-        "deadline_reminder",// task/project due date is near
-        "general",// any other notification
-        "meeting_invite",// invited to a meeting
+        "task_assigned",
+        "task_updated",
+        "task_completed",
+        "project_assigned",
+        "project_updated",
+        "member_added",
+        "member_removed",
+        "deadline_reminder",
+        "general",
+        "meeting_invite",
       ],
       required: true,
     },
     is_read: {
       type: Boolean,
-      default: false,// false = unread (shows red dot)
+      default: false,
     },
     ref_id: {
       type: mongoose.Schema.Types.ObjectId,
-      default: null,                // ID of the related document
+      default: null,
     },
     ref_type: {
       type: String,
       enum: ["Task", "Project", "User", "ProjectMember", "Meeting", null],
-      default: null,                // which model ref_id points to
+      default: null,
+    },
+    // ── Outbox fields ──────────────────────────────────────────────────────
+    is_sent: {
+      type: Boolean,
+      default: false,               // true = this doc is the sender's outbox copy
+    },
+    recipient_count: {
+      type: Number,
+      default: null,                // how many users received it (outbox only)
     },
   },
-  { timestamps: true }              // timestamps handles created_at
+  { timestamps: true }
 );
 
-// Fetch unread notifications faster
 NotificationSchema.index({ user_id: 1, is_read: 1 });
+NotificationSchema.index({ sender_id: 1, is_sent: 1 });
 
 const Notification = mongoose.model("Notification", NotificationSchema);
 module.exports = Notification;
