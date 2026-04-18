@@ -17,6 +17,25 @@ const ProjectSchema = mongoose.Schema(
       ref: "User",
       required: [true, "Please assign a manager"],
     },
+
+    // ── Project type drives auto-assignment department matching ──────────
+    project_type: {
+      type: String,
+      enum: [
+        "website",
+        "mobile_app",
+        "ecommerce",
+        "api_service",
+        "data_analytics",
+        "design",
+        "content",
+        "seo",
+        "marketing",
+        "other",
+      ],
+      default: "other",
+    },
+
     status: {
       type: String,
       enum: ["planning", "active", "on-hold", "completed", "cancelled"],
@@ -28,19 +47,11 @@ const ProjectSchema = mongoose.Schema(
       default: "medium",
       required: true,
     },
-    start_date: {
-      type: Date,
-      required: [true, "Please enter start date"],
-    },
-    end_date: {
-      type: Date,
-      required: [true, "Please enter end date"],
-    },
-    completed_at: {
-      type: Date,
-      default: null,
-    },
-    // ── Client information collected during project intake ──────────────────
+
+    start_date: { type: Date, required: [true, "Please enter start date"] },
+    end_date:   { type: Date, required: [true, "Please enter end date"] },
+    completed_at: { type: Date, default: null },
+
     client_info: {
       name:         { type: String, default: null, trim: true },
       email:        { type: String, default: null, trim: true },
