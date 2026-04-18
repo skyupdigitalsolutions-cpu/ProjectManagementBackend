@@ -53,6 +53,14 @@ const TasksSchema = mongoose.Schema(
       default: null,
     },
 
+    // ── Module / auto-plan metadata ────────────────────────────────────────
+    module_name: { type: String, default: null, trim: true },         // e.g. "Authentication"
+    estimated_days: { type: Number, default: 1 },                     // used by scheduler (1–3 days per task)
+
+    // ── Day-wise scheduling ────────────────────────────────────────────────
+    start_date: { type: Date, default: null },                         // scheduled start
+    end_date:   { type: Date, default: null },                         // scheduled end
+
     // ── Auto-assign metadata ───────────────────────────────────────────────
     is_auto_assigned: { type: Boolean, default: false },
     auto_assign_reason: { type: String, default: null, trim: true },
@@ -87,7 +95,9 @@ const TasksSchema = mongoose.Schema(
     // numeric score used for smart sorting (higher = do first)
     priority_score: { type: Number, default: 0 },
 
+    // due_date kept for backward compat — mirrors end_date when auto-scheduled
     due_date: { type: Date, required: true },
+
     estimated_hours: { type: Number, default: null },
     actual_hours: { type: Number, default: null },
     completed_at: { type: Date, default: null },
@@ -98,13 +108,13 @@ const TasksSchema = mongoose.Schema(
     // ── Delay tracking ────────────────────────────────────────────────────
     delay_logs: [DelayLogSchema],
     is_delayed: { type: Boolean, default: false },
-    delay_reason: { type: String, default: null, trim: true }, // latest reason shortcut
+    delay_reason: { type: String, default: null, trim: true },
 
     // ── Reassignment history ──────────────────────────────────────────────
     reassign_logs: [ReassignLogSchema],
 
     // ── Department / role tag (for smart matching) ────────────────────────
-    required_role: { type: String, default: null, trim: true },   // e.g. "frontend developer"
+    required_role: { type: String, default: null, trim: true },         // e.g. "frontend developer"
     required_department: { type: String, default: null, trim: true },
   },
   { timestamps: true }
@@ -114,6 +124,8 @@ const TasksSchema = mongoose.Schema(
 TasksSchema.index({ assigned_to: 1, status: 1, priority: -1 });
 TasksSchema.index({ project_id: 1, status: 1 });
 TasksSchema.index({ due_date: 1, is_delayed: 1 });
+TasksSchema.index({ project_id: 1, module_name: 1 });        // for module-grouped views
+TasksSchema.index({ start_date: 1, end_date: 1 });            // for Gantt/timeline queries
 
 const Task = mongoose.model("Task", TasksSchema);
 module.exports = Task;
