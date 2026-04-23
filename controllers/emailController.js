@@ -1,44 +1,24 @@
 /**
  * controllers/emailController.js
- * ─────────────────────────────────────────────────────────────────────────────
- * Handles admin → employee email with optional file attachments.
- *
- * POST /api/email/send  (multipart/form-data)
- * Body fields:
- *   user_ids     — JSON string array of recipient user IDs
- *   subject      — email subject
- *   body         — plain-text or HTML body
- *   attachments  — zero or more files (from multer)
- *
- * Flow:
- *  1. Validate fields
- *  2. Look up recipient emails from DB
- *  3. Send email via nodemailer to each recipient
- *  4. Return success summary
+ * Uses Brevo (formerly Sendinblue) HTTP API — no SMTP, no nodemailer.
  */
 
-const nodemailer   = require('nodemailer');
+const Brevo        = require('@getbrevo/brevo');
 const User         = require('../models/users');
 const fs           = require('fs');
 
-// ─── Transporter factory ──────────────────────────────────────────────────────
+// ─── Brevo client factory ─────────────────────────────────────────────────────
 
-function createTransporter() {
-  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+function createBrevoClient() {
+  if (!process.env.BREVO_API_KEY) {
     throw new Error(
-      'Email not configured. Set EMAIL_USER and EMAIL_PASS in your .env file. ' +
-      'See .env.example for instructions.'
+      'Email not configured. Set BREVO_API_KEY in your .env file.'
     );
   }
-  return nodemailer.createTransport({
-    host:   process.env.EMAIL_HOST || 'smtp.gmail.com',
-    port:   parseInt(process.env.EMAIL_PORT || '587'),
-    secure: false,
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
-    },
-  });
+
+  const apiInstance = new Brevo.TransactionalEmailsApi();
+  apiInstance.authentications['api-key'].apiKey = process.env.BREVO_API_KEY;
+  return apiInstance;
 }
 
 // ─── Helper: clean up uploaded temp files ────────────────────────────────────
@@ -49,7 +29,7 @@ function cleanupFiles(files = []) {
   });
 }
 
-// ─── Controller ──────────────────────────────────────────────────────────────
+// ─── Controller: sendEmail ────────────────────────────────────────────────────
 
 const sendEmail = async (req, res) => {
   const uploadedFiles = req.files || [];
@@ -87,28 +67,36 @@ const sendEmail = async (req, res) => {
       return res.status(404).json({ success: false, message: 'No valid recipients found' });
     }
 
-    // ── 3. Build attachments array for nodemailer ─────────────────────────
+    // ── 3. Build attachments for Brevo (base64 encoded) ───────────────────
     const attachments = uploadedFiles.map(f => ({
-      filename: f.originalname,
-      path:     f.path,
+      name:    f.originalname,
+      content: fs.readFileSync(f.path).toString('base64'),
     }));
 
-    // ── 4. Create transporter (throws if not configured) ──────────────────
-    const transporter = createTransporter();
+    // ── 4. Create Brevo client ────────────────────────────────────────────
+    const apiInstance = createBrevoClient();
 
-    const senderName  = req.user?.name  || 'Admin';
-    const senderEmail = process.env.EMAIL_FROM || process.env.EMAIL_USER;
+    const senderName  = req.user?.name || process.env.EMAIL_FROM_NAME || 'Admin';
+    const senderEmail = process.env.EMAIL_USER;
 
-    // HTML email template
+    if (!senderEmail) {
+      cleanupFiles(uploadedFiles);
+      return res.status(503).json({
+        success: false,
+        message: 'EMAIL_USER is not set in environment variables.',
+      });
+    }
+
+    // ── 5. HTML email template ────────────────────────────────────────────
     const htmlBody = `
       <!DOCTYPE html>
       <html>
       <head>
         <meta charset="utf-8">
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                  background: #f8fafc; margin: 0; padding: 20px; color: #334155; }
-          .card { background: #ffffff; border-radius: 12px; padding: 32px; 
+          .card { background: #ffffff; border-radius: 12px; padding: 32px;
                   max-width: 600px; margin: 0 auto; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
           .header { border-bottom: 2px solid #e2e8f0; padding-bottom: 16px; margin-bottom: 24px; }
           .brand { font-size: 18px; font-weight: 700; color: #6366f1; }
@@ -136,18 +124,23 @@ const sendEmail = async (req, res) => {
       </html>
     `;
 
-    // ── 5. Send email to each recipient ───────────────────────────────────
+    // ── 6. Send one email per recipient via Brevo API ─────────────────────
     const emailResults = await Promise.allSettled(
-      recipients.map(r =>
-        transporter.sendMail({
-          from:        `"${senderName}" <${senderEmail}>`,
-          to:          r.email,
-          subject:     subject.trim(),
-          text:        body.trim(),
-          html:        htmlBody,
-          attachments,
-        })
-      )
+      recipients.map(r => {
+        const sendSmtpEmail = new Brevo.SendSmtpEmail();
+
+        sendSmtpEmail.sender      = { name: senderName, email: senderEmail };
+        sendSmtpEmail.to          = [{ email: r.email, name: r.name }];
+        sendSmtpEmail.subject     = subject.trim();
+        sendSmtpEmail.textContent = body.trim();
+        sendSmtpEmail.htmlContent = htmlBody;
+
+        if (attachments.length > 0) {
+          sendSmtpEmail.attachment = attachments;
+        }
+
+        return apiInstance.sendTransacEmail(sendSmtpEmail);
+      })
     );
 
     const sent   = emailResults.filter(r => r.status === 'fulfilled').length;
@@ -155,7 +148,7 @@ const sendEmail = async (req, res) => {
 
     if (failed > 0) {
       const firstError = emailResults.find(r => r.status === 'rejected')?.reason?.message;
-      console.warn(`[emailController] ${failed} email(s) failed to send:`, firstError);
+      console.warn(`[emailController] ${failed} email(s) failed:`, firstError);
     }
 
     // ── 7. Cleanup temp files ─────────────────────────────────────────────
@@ -176,11 +169,10 @@ const sendEmail = async (req, res) => {
     cleanupFiles(uploadedFiles);
     console.error('[emailController] Error:', error.message);
 
-    // Friendly error for missing email config
     if (error.message.includes('Email not configured')) {
       return res.status(503).json({
         success: false,
-        message: 'Email service is not configured on the server. Please contact your administrator.',
+        message: 'Email service is not configured. Please contact your administrator.',
       });
     }
 
@@ -188,16 +180,7 @@ const sendEmail = async (req, res) => {
   }
 };
 
-module.exports = { sendEmail };
-// ─── APPROVAL REQUEST (notification-based, no email) ─────────────────────────
-// POST /api/email/send-approval-request
-// Any employee can call this to send an in-app approval request notification
-// to all admins and managers about a task or project.
-// Body (multipart or JSON):
-//   message   — employee's message (required, min 5 chars)
-//   ref_type  — "Task" | "Project" (optional)
-//   ref_id    — ObjectId of the referenced item (optional)
-//   subject   — short subject line shown in notification (optional)
+// ─── Controller: sendApprovalRequest (unchanged — no email involved) ──────────
 
 const sendApprovalRequest = async (req, res) => {
   try {
@@ -207,24 +190,20 @@ const sendApprovalRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please provide a message (min 5 characters)' });
     }
 
-    const mongoose = require('mongoose');
+    const mongoose     = require('mongoose');
     const Notification = require('../models/notification');
 
-    // Validate ref_id if provided
     const validRefTypes = ['Task', 'Project', 'User', 'ProjectMember', 'Meeting', 'Assignment'];
-    const safeRefType = validRefTypes.includes(ref_type) ? ref_type : null;
-    const safeRefId   = ref_id && mongoose.Types.ObjectId.isValid(ref_id) ? ref_id : null;
+    const safeRefType   = validRefTypes.includes(ref_type) ? ref_type : null;
+    const safeRefId     = ref_id && mongoose.Types.ObjectId.isValid(ref_id) ? ref_id : null;
 
-    // Collect optional attachment names
-    const attachments = (req.files || []).map(f => f.originalname);
-    const attachmentNote = attachments.length > 0
-      ? ` [${attachments.length} file(s): ${attachments.join(', ')}]`
+    const attachmentNote = (req.files || []).length > 0
+      ? ` [${req.files.length} file(s): ${req.files.map(f => f.originalname).join(', ')}]`
       : '';
 
-    const subjectLine = subject ? `[${subject.trim().substring(0, 60)}] ` : '';
-    const notifMessage = `📋 ${subjectLine}Approval request from ${req.user.name}: ${message.trim().substring(0, 150)}${attachmentNote}`;
+    const subjectLine   = subject ? `[${subject.trim().substring(0, 60)}] ` : '';
+    const notifMessage  = `📋 ${subjectLine}Approval request from ${req.user.name}: ${message.trim().substring(0, 150)}${attachmentNote}`;
 
-    // Notify all admins and managers
     const recipients = await User.find({ role: { $in: ['admin', 'manager'] }, status: 'active' }).select('_id');
 
     if (recipients.length === 0) {
@@ -253,4 +232,4 @@ const sendApprovalRequest = async (req, res) => {
   }
 };
 
-module.exports.sendApprovalRequest = sendApprovalRequest;
+module.exports = { sendEmail, sendApprovalRequest };
