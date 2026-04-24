@@ -1,11 +1,11 @@
 /**
  * controllers/emailController.js
- * Uses Brevo (formerly Sendinblue) HTTP API — no SMTP, no nodemailer.
+ * Uses Brevo (formerly Sendinblue) HTTP API — SDK v5 compatible.
  */
 
-const Brevo        = require('@getbrevo/brevo');
-const User         = require('../models/users');
-const fs           = require('fs');
+const { BrevoClient, BrevoEnvironment } = require('@getbrevo/brevo');
+const User = require('../models/users');
+const fs   = require('fs');
 
 // ─── Brevo client factory ─────────────────────────────────────────────────────
 
@@ -16,12 +16,13 @@ function createBrevoClient() {
     );
   }
 
-  const apiInstance = new Brevo.TransactionalEmailsApi();
-  apiInstance.authentications['api-key'].apiKey = process.env.BREVO_API_KEY;
-  return apiInstance;
+  return new BrevoClient({
+    apiKey:      process.env.BREVO_API_KEY,
+    environment: BrevoEnvironment.Production,
+  });
 }
 
-// ─── Helper: clean up uploaded temp files ────────────────────────────────────
+// ─── Helper: clean up uploaded temp files ─────────────────────────────────────
 
 function cleanupFiles(files = []) {
   files.forEach(f => {
@@ -67,14 +68,14 @@ const sendEmail = async (req, res) => {
       return res.status(404).json({ success: false, message: 'No valid recipients found' });
     }
 
-    // ── 3. Build attachments for Brevo (base64 encoded) ───────────────────
+    // ── 3. Build attachments (base64 encoded) ─────────────────────────────
     const attachments = uploadedFiles.map(f => ({
       name:    f.originalname,
       content: fs.readFileSync(f.path).toString('base64'),
     }));
 
-    // ── 4. Create Brevo client ────────────────────────────────────────────
-    const apiInstance = createBrevoClient();
+    // ── 4. Create Brevo v5 client ─────────────────────────────────────────
+    const client = createBrevoClient();
 
     const senderName  = req.user?.name || process.env.EMAIL_FROM_NAME || 'Admin';
     const senderEmail = process.env.EMAIL_USER;
@@ -124,22 +125,22 @@ const sendEmail = async (req, res) => {
       </html>
     `;
 
-    // ── 6. Send one email per recipient via Brevo API ─────────────────────
+    // ── 6. Send one email per recipient via Brevo v5 API ──────────────────
     const emailResults = await Promise.allSettled(
       recipients.map(r => {
-        const sendSmtpEmail = new Brevo.SendSmtpEmail();
-
-        sendSmtpEmail.sender      = { name: senderName, email: senderEmail };
-        sendSmtpEmail.to          = [{ email: r.email, name: r.name }];
-        sendSmtpEmail.subject     = subject.trim();
-        sendSmtpEmail.textContent = body.trim();
-        sendSmtpEmail.htmlContent = htmlBody;
+        const emailPayload = {
+          sender:      { name: senderName, email: senderEmail },
+          to:          [{ email: r.email, name: r.name }],
+          subject:     subject.trim(),
+          textContent: body.trim(),
+          htmlContent: htmlBody,
+        };
 
         if (attachments.length > 0) {
-          sendSmtpEmail.attachment = attachments;
+          emailPayload.attachment = attachments;
         }
 
-        return apiInstance.sendTransacEmail(sendSmtpEmail);
+        return client.transactionalEmails.sendTransacEmail(emailPayload);
       })
     );
 
@@ -180,7 +181,7 @@ const sendEmail = async (req, res) => {
   }
 };
 
-// ─── Controller: sendApprovalRequest (unchanged — no email involved) ──────────
+// ─── Controller: sendApprovalRequest ─────────────────────────────────────────
 
 const sendApprovalRequest = async (req, res) => {
   try {
@@ -201,8 +202,8 @@ const sendApprovalRequest = async (req, res) => {
       ? ` [${req.files.length} file(s): ${req.files.map(f => f.originalname).join(', ')}]`
       : '';
 
-    const subjectLine   = subject ? `[${subject.trim().substring(0, 60)}] ` : '';
-    const notifMessage  = `📋 ${subjectLine}Approval request from ${req.user.name}: ${message.trim().substring(0, 150)}${attachmentNote}`;
+    const subjectLine  = subject ? `[${subject.trim().substring(0, 60)}] ` : '';
+    const notifMessage = `📋 ${subjectLine}Approval request from ${req.user.name}: ${message.trim().substring(0, 150)}${attachmentNote}`;
 
     const recipients = await User.find({ role: { $in: ['admin', 'manager'] }, status: 'active' }).select('_id');
 
