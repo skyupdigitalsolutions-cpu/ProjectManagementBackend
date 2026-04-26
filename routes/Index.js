@@ -17,7 +17,7 @@ const router  = express.Router();
 const authRoutes         = require('./Authroutes');
 
 // ── User / People ─────────────────────────────────────────────────────────────
-const userRoutes         = require('./userRoutes');
+const userRoutes         = require('./Userroutes');
 const memberRoutes       = require('./Memberroutes');
 
 // ── Attendance & eSSL ─────────────────────────────────────────────────────────
