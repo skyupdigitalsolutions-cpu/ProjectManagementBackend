@@ -24,7 +24,7 @@ const {
   uploadTemplate,
   getTemplate,
   getTemplateTasks,
-} = require('../controllers/excelTemplateController')
+} = require('../controllers/Exceltemplatecontroller')
 
 // ── GET /api/excel-template ───────────────────────────────────────────────────
 // Any authenticated user can check if a template exists.
