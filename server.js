@@ -81,7 +81,7 @@ app.get('/seed-admin', async (req, res) => {
 // FIX: excelTemplateRoutes must be mounted BEFORE app.use('/api', routes)
 // because the catch-all /api router would intercept the request first
 // and return 404 before excelTemplateRoutes ever gets a chance to handle it.
-app.use('/api/excel-template', require('./routes/excelTemplateRoutes'));
+app.use('/api/excel-template', require('./routes/Exceltemplateroutes'));
 app.use('/api', routes);
 
 // ─── 404 ─────────────────────────────────────────────────────────────────────
