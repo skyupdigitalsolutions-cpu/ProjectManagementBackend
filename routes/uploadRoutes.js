@@ -22,7 +22,7 @@ const {
   importFromExcel,
   downloadTemplate,
   getImportedTasks,
-} = require('../controllers/uploadController');
+} = require('../controllers/Uploadcontroller');
 
 // Download template — any authenticated user can get it
 router.get('/template', protect, downloadTemplate);
