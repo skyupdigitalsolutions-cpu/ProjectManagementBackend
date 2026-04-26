@@ -25,8 +25,8 @@ const attendanceRoutes   = require('./Attendanceroutes');
 const esslRoutes         = require('./Esslroutes');       // eSSL Fingerprint Machine
 
 // ── Projects & Tasks ──────────────────────────────────────────────────────────
-const projectRoutes      = require('./projectRoutes');
-const taskRoutes         = require('./taskRoutes');
+const projectRoutes      = require('./Projectroutes');
+const taskRoutes         = require('./Taskroutes');
 
 // ── Clients & Import ──────────────────────────────────────────────────────────
 const clientRoutes       = require('./clientRoutes');
