@@ -141,14 +141,16 @@ const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSeria
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;
-    console.log(`[eSSL] Device handshake — Serial: ${SN}`);
+    console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)}`);
 
     // Respond with current server time so device syncs its clock
     const now = new Date();
     const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
 
+    // FIX: TimeZone=5.5 = IST (UTC+5:30). TransTimes pushes at midnight and every 30 min.
+    // Realtime=1 means device also pushes each punch immediately as it happens.
     res.set("Content-Type", "text/plain");
-    res.send(`GET OPTION FROM: ${SN}\nATTSTAMP\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=TransData AttLog OpLog EnrollUser\nTimeZone=5.5\nRealtime=1\nEncrypt=0\nServerVer=2.4\nTableNameFix=0\nDate=${timestamp}\n`);
+    res.send(`GET OPTION FROM: ${SN}\nATTSTAMP\nErrorDelay=30\nDelay=10\nTransTimes=00:00;00:30;01:00;01:30;02:00;02:30;03:00;03:30;04:00;04:30;05:00;05:30;06:00;06:30;07:00;07:30;08:00;08:30;09:00;09:30;10:00;10:30;11:00;11:30;12:00;12:30;13:00;13:30;14:00;14:30;15:00;15:30;16:00;16:30;17:00;17:30;18:00;18:30;19:00;19:30;20:00;20:30;21:00;21:30;22:00;22:30;23:00;23:30\nTransInterval=1\nTransFlag=TransData AttLog OpLog EnrollUser\nTimeZone=5.5\nRealtime=1\nEncrypt=0\nServerVer=2.4\nTableNameFix=0\nDate=${timestamp}\n`);
   } catch (err) {
     console.error("[eSSL] Handshake error:", err);
     res.status(500).send("ERROR");
@@ -182,9 +184,11 @@ const admsReceiver = async (req, res) => {
   try {
     const { SN: deviceSerial, table } = req.query;
 
+    console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
+
     // Only process attendance logs; ignore other tables (EnrollUser, OpLog, etc.)
     if (table !== "ATTLOG") {
-      console.log(`[eSSL] Ignoring table: ${table} from device ${deviceSerial}`);
+      console.log(`[eSSL] ⏭ Ignoring table: ${table} from device ${deviceSerial}`);
       res.set("Content-Type", "text/plain");
       return res.send("OK");
     }
@@ -239,7 +243,7 @@ const admsReceiver = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
-        console.warn(`[eSSL] No user found with fingerprint_id="${fpId}" — skipping`);
+        console.warn(`[eSSL] ⚠️  No user with fingerprint_id="${fpId}" — punch skipped. Run PATCH /api/essl/assign-fingerprint to map this ID.`);
         results.skipped++;
         continue;
       }

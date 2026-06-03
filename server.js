@@ -1,20 +1,25 @@
 /**
  * server.js
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES:
- *  1. workflowHandlers and initCronJobs called after mongoose.connect()
- *  2. express.text() body parser added for eSSL ADMS plain-text body
- *  3. eSSL ADMS routes registered at ROOT level (/iclock/cdata)
- *     because eSSL devices always append /iclock/cdata to the domain —
- *     you cannot change the path on the device itself.
- *  4. FIX: excelTemplateRoutes mounted BEFORE /api catch-all router
+ *  ESSL / ZKTeco Device Settings (Cloud Server Setting on device menu):
+ *    Server Mode    : ADMS
+ *    Enable Domain  : ON
+ *    Server Address : project-management-backend-gvpy.onrender.com   ← bare domain, no https://, no trailing slash
+ *    Server Port    : 443                                             ← HTTPS port for Render
+ *    Enable Proxy   : OFF
+ *    HTTPS          : ON
  *
- *  Device setting on eSSL:
- *    Server Address : project-management-backend-gvpy.onrender.com
- *    Server Port    : 443
  *  Device will call:
- *    GET  https://project-management-backend-gvpy.onrender.com/iclock/cdata
- *    POST https://project-management-backend-gvpy.onrender.com/iclock/cdata
+ *    GET  https://project-management-backend-gvpy.onrender.com/iclock/cdata       ← handshake
+ *    POST https://project-management-backend-gvpy.onrender.com/iclock/cdata       ← push logs
+ *    GET  https://project-management-backend-gvpy.onrender.com/iclock/getrequest  ← poll for commands
+ *
+ *  IMPORTANT — fingerprint mapping:
+ *    Every employee must have fingerprint_id set in their User document.
+ *    Use: PATCH /api/essl/assign-fingerprint  { user_id, fingerprint_id }
+ *    Without this, all punches are silently skipped.
+ *
+ *  To keep Render free tier awake, ping /ping every 5 min via UptimeRobot.
  */
 
 const express  = require('express');
@@ -61,6 +66,10 @@ app.use('/uploads', require('./middleware/authMiddleware').protect, express.stat
 app.get('/', (req, res) => {
   res.status(200).json({ success: true, message: 'Server is running', environment: process.env.NODE_ENV || 'development' });
 });
+
+// ─── Keep-alive (prevents Render free tier cold starts) ───────────────────────
+// Point UptimeRobot or any cron service at GET /ping every 5 minutes.
+app.get('/ping', (req, res) => res.send('pong'));
 
 // ─── Seed Admin ───────────────────────────────────────────────────────────────
 app.get('/seed-admin', async (req, res) => {
