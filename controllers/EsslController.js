@@ -184,6 +184,11 @@ const admsReceiver = async (req, res) => {
   try {
     const { SN: deviceSerial, table } = req.query;
 
+    // The body comes as plain text from the device.
+    // NOTE: declare rawBody BEFORE any use (was referenced before init = crash).
+    const rawBody =
+      typeof req.body === "string" ? req.body : req.body?.toString?.() || "";
+
     console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
 
     // Only process attendance logs; ignore other tables (EnrollUser, OpLog, etc.)
@@ -192,10 +197,6 @@ const admsReceiver = async (req, res) => {
       res.set("Content-Type", "text/plain");
       return res.send("OK");
     }
-
-    // The body comes as plain text from the device
-    const rawBody =
-      typeof req.body === "string" ? req.body : req.body?.toString?.() || "";
 
     if (!rawBody.trim()) {
       res.set("Content-Type", "text/plain");
