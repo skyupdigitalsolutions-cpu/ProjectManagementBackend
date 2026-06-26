@@ -210,7 +210,7 @@ const admsReceiver = async (req, res) => {
       if (parts.length < 2) continue;
 
       const [fingerprintId, datetimeStr, typeCode = "0", verifyCode = "1"] = parts;
-      const punchTime = new Date(datetimeStr);
+      const punchTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
       if (isNaN(punchTime)) continue;
 
       const dateKey = punchTime.toISOString().slice(0, 10); // "YYYY-MM-DD"
