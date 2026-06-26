@@ -1,27 +1,3 @@
-/**
- * server.js
- * ─────────────────────────────────────────────────────────────────────────────
- *  ESSL / ZKTeco Device Settings (Cloud Server Setting on device menu):
- *    Server Mode    : ADMS
- *    Enable Domain  : ON
- *    Server Address : project-management-backend-gvpy.onrender.com   ← bare domain, no https://, no trailing slash
- *    Server Port    : 443                                             ← HTTPS port for Render
- *    Enable Proxy   : OFF
- *    HTTPS          : ON
- *
- *  Device will call:
- *    GET  https://project-management-backend-gvpy.onrender.com/iclock/cdata       ← handshake
- *    POST https://project-management-backend-gvpy.onrender.com/iclock/cdata       ← push logs
- *    GET  https://project-management-backend-gvpy.onrender.com/iclock/getrequest  ← poll for commands
- *
- *  IMPORTANT — fingerprint mapping:
- *    Every employee must have fingerprint_id set in their User document.
- *    Use: PATCH /api/essl/assign-fingerprint  { user_id, fingerprint_id }
- *    Without this, all punches are silently skipped.
- *
- *  To keep Render free tier awake, ping /ping every 5 min via UptimeRobot.
- */
-
 const express  = require('express');
 const mongoose = require('mongoose');
 const cors     = require('cors');
@@ -49,7 +25,10 @@ app.use(express.urlencoded({ extended: true }));
 // ─── eSSL ADMS plain-text body parser ────────────────────────────────────────
 // The device POSTs attendance logs as plain text, not JSON.
 // Must be registered before routes so req.body is available.
+// NOTE: the device firmware (iClock Proxy) calls the ".aspx" variants, so we
+// register the text parser for those paths too.
 app.use('/iclock/cdata',          express.text({ type: '*/*' }));
+app.use('/iclock/cdata.aspx',     express.text({ type: '*/*' }));
 app.use('/api/essl/iclock/cdata', express.text({ type: '*/*' }));
 
 // ─── eSSL ADMS Device Routes (ROOT level — device cannot use /api prefix) ────
@@ -58,6 +37,12 @@ app.use('/api/essl/iclock/cdata', express.text({ type: '*/*' }));
 app.get('/iclock/cdata',      admsHandshake);  // Device registration / clock sync
 app.post('/iclock/cdata',     admsReceiver);   // Device pushes attendance punch logs
 app.get('/iclock/getrequest', getRequest);     // Device polling for server commands
+
+// Same handlers for the ".aspx" paths the device firmware actually calls
+// (seen in logs as POST /iclock/cdata.aspx?...&table=ATTLOG|OPERLOG).
+app.get('/iclock/cdata.aspx',      admsHandshake);
+app.post('/iclock/cdata.aspx',     admsReceiver);
+app.get('/iclock/getrequest.aspx', getRequest);
 
 const path = require('path');
 app.use('/uploads', require('./middleware/authMiddleware').protect, express.static(path.join(__dirname, 'uploads')));
