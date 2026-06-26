@@ -1,5 +1,14 @@
 const mongoose = require("mongoose");
 
+const RawLogSchema = new mongoose.Schema(
+  {
+    time: { type: Date },
+    type: { type: String },   // wrapped so Mongoose treats "type" as a field, not a type declaration
+    verify: { type: String },
+  },
+  { _id: false }
+);
+
 const AttendanceSchema = mongoose.Schema(
   {
     user_id: {
@@ -41,15 +50,9 @@ const AttendanceSchema = mongoose.Schema(
       type: String,
       default: null,               // serial number of the eSSL device that sent the record
     },
-    raw_logs: {
-      type: [
-        {
-          time: Date,
-          type: String,            // "check-in" | "check-out" | "break-in" | "break-out"
-          verify: String,          // "fingerprint" | "card" | "password" | "face"
-        },
-      ],
-      default: [],                 // all raw punch events from the device for this day
+   raw_logs: {
+      type: [RawLogSchema],
+      default: [],
     },
   },
   { timestamps: true }
