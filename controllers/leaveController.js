@@ -4,10 +4,12 @@
  * CHANGES FROM ORIGINAL:
  *  1. applyLeave: destructure from (req.body || {}) so a missing/empty body
  *     returns a clean 400 instead of throwing a 500.
- *  2. updateLeaveStatus: when status = "approved", emits 'leave:approved' event
+ *  2. applyLeave: uploads any attached files (req.files) to Cloudinary and
+ *     saves the returned URLs into leave.documents.
+ *  3. updateLeaveStatus: when status = "approved", emits 'leave:approved' event
  *     → workflowHandlers.js triggers handleLeaveReassignment
- *  3. Added getLeaveById
- *  4. Renamed deleteLeave → cancelLeave to match Leaveroutes.js
+ *  4. Added getLeaveById
+ *  5. Renamed deleteLeave → cancelLeave to match Leaveroutes.js
  */
 
 const mongoose  = require('mongoose');
@@ -15,6 +17,7 @@ const Leave     = require('../models/leave');
 const User      = require('../models/users');
 const Notification = require('../models/notification');
 const eventBus  = require('../services/eventBus');
+const { uploadBufferToCloudinary } = require('../config/cloudinary');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 const handleError = (res, error, statusCode = 500) => {
@@ -56,6 +59,24 @@ const applyLeave = async (req, res) => {
     if (overlap)
       return res.status(409).json({ success: false, message: 'You already have a leave request overlapping these dates' });
 
+    // ── Upload any attached files to Cloudinary ──────────────────────────────
+    // multer (memoryStorage) puts files on req.files. Each is uploaded and we
+    // keep { name, url, type } — the shape Leave.documents expects.
+    let documents = [];
+    if (Array.isArray(req.files) && req.files.length > 0) {
+      try {
+        documents = await Promise.all(
+          req.files.map((file) => uploadBufferToCloudinary(file, 'leave-documents'))
+        );
+      } catch (uploadErr) {
+        console.error('[Leave] Cloudinary upload failed:', uploadErr.message);
+        return res.status(502).json({
+          success: false,
+          message: 'Failed to upload supporting document(s). Please try again.',
+        });
+      }
+    }
+
     const leave = await Leave.create({
       user_id: req.user._id,
       leave_type,
@@ -66,6 +87,7 @@ const applyLeave = async (req, res) => {
       is_urgent: is_urgent === true || is_urgent === 'true',
       contact_during_leave: contact_during_leave || null,
       handover_notes:       handover_notes       || null,
+      documents,
     });
 
     return res.status(201).json({ success: true, data: leave });
