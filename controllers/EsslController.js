@@ -19,7 +19,7 @@
  * HOW fingerprint_id MAPS TO employees:
  *   Each employee must have their fingerprint_id set in the User document.
  *   This is the same ID they were enrolled with on the device (e.g., "1", "42").
- *   Set it via PATCH /api/users/:id  { fingerprint_id: "5" }
+ *   Set it via PATCH /api/essl/assign-fingerprint  { user_id, fingerprint_id }
  */
 
 const Attendance = require("../models/attendance");
@@ -102,11 +102,11 @@ const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSeria
   const hours_worked = clock_out ? calcHours(clock_in, clock_out) : null;
   const status = deriveStatus(clock_in, clock_out);
 
-  // Build raw_logs array from all punches
+  // Build raw_logs array from all punches (coerce to strings to match schema).
   const raw_logs = punches.map((p) => ({
     time: new Date(p.time),
-    type: p.type,
-    verify: p.verify,
+    type: String(p.type),
+    verify: String(p.verify),
   }));
 
   const record = await Attendance.findOneAndUpdate(
@@ -120,11 +120,13 @@ const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSeria
         source: "fingerprint",
         device_serial: deviceSerial || null,
       },
-      $addToSet: {
+      // $push (not $addToSet) — raw_logs is an array of subdocuments; $push
+      // appends the new punch events for this day.
+      $push: {
         raw_logs: { $each: raw_logs },
       },
     },
-    { upsert: true, new: true, runValidators: true }
+    { upsert: true, returnDocument: "after", runValidators: true }
   );
 
   return record;
@@ -174,18 +176,12 @@ const getRequest = (req, res) => {
  * Query: ?SN=SERIAL&table=ATTLOG&Stamp=XXXXX
  * Body (plain text, one line per punch):
  *   fingerprint_id\tYYYY-MM-DD HH:MM:SS\tpunch_type\tverify_method\t0\t0
- *
- * Example body:
- *   1	2024-06-15 09:02:11	0	1	0	0
- *   1	2024-06-15 18:30:44	1	1	0	0
- *   2	2024-06-15 09:15:00	0	1	0	0
  */
 const admsReceiver = async (req, res) => {
   try {
     const { SN: deviceSerial, table } = req.query;
 
     // The body comes as plain text from the device.
-    // NOTE: declare rawBody BEFORE any use (was referenced before init = crash).
     const rawBody =
       typeof req.body === "string" ? req.body : req.body?.toString?.() || "";
 
@@ -406,7 +402,7 @@ const assignFingerprintId = async (req, res) => {
     const user = await User.findByIdAndUpdate(
       user_id,
       { fingerprint_id: String(fingerprint_id).trim() },
-      { new: true }
+      { returnDocument: "after" }
     ).select("-password");
 
     if (!user) {
