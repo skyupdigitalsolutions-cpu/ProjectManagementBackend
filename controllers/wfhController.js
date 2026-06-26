@@ -9,7 +9,7 @@
  *   PATCH  /api/wfh/override/:user_id        — admin sets work_mode + attendance_override
  */
 
-const WfhRequest = require('../models/wfhRequest');
+const WfhRequest = require('../models/WfhRequest');
 const User       = require('../models/users');
 
 // ─────────────────────────────────────────────────────────────────────────────
