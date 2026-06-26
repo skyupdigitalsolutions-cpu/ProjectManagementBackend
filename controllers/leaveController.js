@@ -2,10 +2,11 @@
  * controllers/leaveController.js  (UPDATED)
  * ─────────────────────────────────────────────────────────────────────────────
  * CHANGES FROM ORIGINAL:
- *  1. updateLeaveStatus: when status = "approved", emits 'leave:approved' event
+ *  1. applyLeave: destructure from (req.body || {}) so a missing/empty body
+ *     returns a clean 400 instead of throwing a 500.
+ *  2. updateLeaveStatus: when status = "approved", emits 'leave:approved' event
  *     → workflowHandlers.js triggers handleLeaveReassignment
- *  2. Removed direct import of handleLeaveReassignment (now event-driven)
- *  3. Added getLeaveById (was missing entirely)
+ *  3. Added getLeaveById
  *  4. Renamed deleteLeave → cancelLeave to match Leaveroutes.js
  */
 
@@ -25,7 +26,12 @@ const handleError = (res, error, statusCode = 500) => {
 
 const applyLeave = async (req, res) => {
   try {
-    const { leave_type, from_date, to_date, days, reason, is_urgent, contact_during_leave, handover_notes } = req.body;
+    // Defensive: with multipart uploads, if the parser hasn't run req.body can be
+    // undefined. `|| {}` turns that into a clean 400 below rather than a 500.
+    const {
+      leave_type, from_date, to_date, days, reason,
+      is_urgent, contact_during_leave, handover_notes,
+    } = req.body || {};
 
     if (!leave_type || !from_date || !to_date || !days || !reason)
       return res.status(400).json({ success: false, message: 'leave_type, from_date, to_date, days, and reason are required' });
@@ -57,7 +63,7 @@ const applyLeave = async (req, res) => {
       to_date:   to,
       days,
       reason:   reason.trim(),
-      is_urgent: !!is_urgent,
+      is_urgent: is_urgent === true || is_urgent === 'true',
       contact_during_leave: contact_during_leave || null,
       handover_notes:       handover_notes       || null,
     });
@@ -97,7 +103,7 @@ const getAllLeaves = async (req, res) => {
     const skip = (Number(page) - 1) * Number(limit);
     const [leaves, total] = await Promise.all([
       Leave.find(filter)
-        .populate('user_id',     'name email department designation')
+        .populate('user_id',     'name email department designation role')
         .populate('reviewed_by', 'name email')
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -147,12 +153,6 @@ const getLeaveById = async (req, res) => {
 /**
  * PATCH /leaves/:id
  * Body: { status: "approved" | "rejected", admin_note? }
- *
- * UPDATED FLOW when approved:
- *  1. Save leave record with status = "approved"
- *  2. Update user status → "on-leave"
- *  3. EMIT 'leave:approved' → workflowHandlers triggers handleLeaveReassignment
- *     (reassigns urgent tasks during leave period to least-loaded teammates)
  */
 const updateLeaveStatus = async (req, res) => {
   try {
@@ -160,7 +160,7 @@ const updateLeaveStatus = async (req, res) => {
     if (!isValidObjectId(id))
       return res.status(400).json({ success: false, message: 'Invalid leave ID' });
 
-    const { status, admin_note } = req.body;
+    const { status, admin_note } = req.body || {};
     if (!['approved', 'rejected'].includes(status))
       return res.status(400).json({ success: false, message: 'status must be "approved" or "rejected"' });
 
@@ -189,10 +189,8 @@ const updateLeaveStatus = async (req, res) => {
     }).catch(console.error);
 
     if (status === 'approved') {
-      // Update user status
       await User.findByIdAndUpdate(leave.user_id._id, { status: 'on-leave' }).catch(console.error);
 
-      // ── EMIT: trigger leave reassignment in background ──────────────────────
       eventBus.emitAsync('leave:approved', {
         leave,
         adminId: req.user._id,
