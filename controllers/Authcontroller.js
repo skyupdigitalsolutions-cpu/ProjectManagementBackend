@@ -16,11 +16,6 @@ const handleError = (res, error, statusCode = 500) => {
 
 // ─── REGISTER ────────────────────────────────────────────────────────────────
 
-/**
- * POST /auth/register
- * Admin-only — creates a new user account.
- * Password is hashed before storing.
- */
 const register = async (req, res) => {
   try {
     const { name, email, password, phone, role, department, designation, joining_date } = req.body;
@@ -64,10 +59,6 @@ const register = async (req, res) => {
 
 // ─── LOGIN ───────────────────────────────────────────────────────────────────
 
-/**
- * POST /auth/login
- * Authenticates user with email + password, returns JWT.
- */
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -108,10 +99,6 @@ const login = async (req, res) => {
 
 // ─── GET ME ──────────────────────────────────────────────────────────────────
 
-/**
- * GET /auth/me
- * Returns the currently authenticated user's profile.
- */
 const getMe = async (req, res) => {
   try {
     return res.status(200).json({ success: true, data: req.user });
@@ -122,10 +109,6 @@ const getMe = async (req, res) => {
 
 // ─── CHANGE PASSWORD ─────────────────────────────────────────────────────────
 
-/**
- * PATCH /auth/change-password
- * Allows logged-in user to change their own password.
- */
 const changePassword = async (req, res) => {
   try {
     const { current_password, new_password } = req.body;

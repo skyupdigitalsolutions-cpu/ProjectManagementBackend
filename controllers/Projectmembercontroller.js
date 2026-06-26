@@ -24,12 +24,6 @@ const canManageProject = async (projectId, user) => {
 
 // ─── ADD MEMBER ──────────────────────────────────────────────────────────────
 
-/**
- * POST /projects/:project_id/members
- * Admin or project manager only.
- * Body: { user_id, role_in_project }
- * Fires a "project_assigned" notification to the added user.
- */
 const addMember = async (req, res) => {
   try {
     const { project_id } = req.params;

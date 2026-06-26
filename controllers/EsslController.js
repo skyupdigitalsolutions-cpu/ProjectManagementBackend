@@ -1,27 +1,3 @@
-/**
- * EsslController.js
- * ─────────────────────────────────────────────────────────────────────────────
- * Handles all eSSL / ZKTeco fingerprint machine integration.
- *
- * TWO METHODS SUPPORTED:
- *
- * 1. ADMS PUSH (Recommended — device sends data to your server automatically)
- *    The eSSL machine is configured with your server URL. It pushes attendance
- *    logs to POST /api/essl/adms every time someone punches in/out.
- *
- * 2. TCP PULL (Manual sync — your server connects to the device and pulls logs)
- *    Admin triggers POST /api/essl/sync with the device IP. Requires the
- *    `node-zklib` npm package (see README).
- *
- * SETUP STEPS:
- *   npm install node-zklib     ← only needed for TCP pull method
- *
- * HOW fingerprint_id MAPS TO employees:
- *   Each employee must have their fingerprint_id set in the User document.
- *   This is the same ID they were enrolled with on the device (e.g., "1", "42").
- *   Set it via PATCH /api/users/:id  { fingerprint_id: "5" }
- */
-
 const Attendance = require("../models/attendance");
 const User = require("../models/users");
 
@@ -132,12 +108,6 @@ const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSeria
 
 // ─── METHOD 1: ADMS PUSH RECEIVER ────────────────────────────────────────────
 
-/**
- * GET /api/essl/adms
- * eSSL device calls this endpoint first to register/check-in with server.
- * The device sends: ?SN=SERIAL&options=all&pushver=2.0.2
- * We must respond with a specific format the device understands.
- */
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;

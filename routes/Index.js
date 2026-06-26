@@ -8,6 +8,8 @@
  *  - uploadRoutes        → /upload
  *  - esslRoutes          → /essl  (eSSL Fingerprint Machine)
  *  - excelTemplateRoutes → /excel-template  (Global Excel Template)
+ *  - wfhRoutes           → /wfh    (Work From Home requests)
+ *  - policyRoutes        → /policy (Attendance policy, holidays, WFH policy)
  */
 
 const express = require('express');
@@ -23,6 +25,10 @@ const memberRoutes          = require('./Memberroutes');
 // ── Attendance & eSSL ─────────────────────────────────────────────────────────
 const attendanceRoutes      = require('./Attendanceroutes');
 const esslRoutes            = require('./Esslroutes');
+
+// ── WFH & Policy ──────────────────────────────────────────────────────────────
+const wfhRoutes             = require('./wfhRoutes');
+const policyRoutes          = require('./policyRoutes');
 
 // ── Projects & Tasks ──────────────────────────────────────────────────────────
 const projectRoutes         = require('./Projectroutes');
@@ -54,6 +60,8 @@ router.use('/users',            userRoutes);
 router.use('/members',          memberRoutes);
 router.use('/attendance',       attendanceRoutes);
 router.use('/essl',             esslRoutes);
+router.use('/wfh',              wfhRoutes);
+router.use('/policy',           policyRoutes);
 router.use('/projects',         projectRoutes);
 router.use('/tasks',            taskRoutes);
 router.use('/clients',          clientRoutes);
