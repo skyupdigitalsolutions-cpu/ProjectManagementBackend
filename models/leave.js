@@ -1,5 +1,18 @@
 const mongoose = require("mongoose");
 
+// An attachment on a leave request. Wrapped in its own schema because the
+// `type` field would otherwise be read by Mongoose as a SchemaType declaration
+// (turning the whole object into a plain String path). The sub-schema makes
+// `type` a real String field. _id disabled — these are simple value objects.
+const LeaveDocumentSchema = new mongoose.Schema(
+  {
+    name: { type: String, default: null },
+    url:  { type: String, default: null },
+    type: { type: String, default: null },
+  },
+  { _id: false }
+);
+
 const LeaveSchema = new mongoose.Schema(
   {
     user_id: {
@@ -66,13 +79,10 @@ const LeaveSchema = new mongoose.Schema(
       default: null,
     },
     // optional document attachments (URLs from cloud storage)
-    documents: [
-      {
-        name: String,
-        url: String,
-        type: String,
-      },
-    ],
+    documents: {
+      type: [LeaveDocumentSchema],
+      default: [],
+    },
   },
   { timestamps: true }
 );
