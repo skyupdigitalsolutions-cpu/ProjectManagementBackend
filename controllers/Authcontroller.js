@@ -18,7 +18,11 @@ const handleError = (res, error, statusCode = 500) => {
 
 const register = async (req, res) => {
   try {
-    const { name, email, password, phone, role, department, designation, joining_date } = req.body;
+    const { email, password } = req.body;
+
+    if (!password) {
+      return res.status(400).json({ success: false, message: "Password is required" });
+    }
 
     const existing = await User.findOne({ email: email?.toLowerCase().trim() });
     if (existing) {
@@ -28,16 +32,19 @@ const register = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      phone,
-      role,
-      department,
-      designation,
-      joining_date,
-    });
+    // Persist every field the admin form provides (personal, banking, statutory,
+    // health, emergency, employment, etc.), minus protected/computed keys.
+    // Mongoose's strict mode drops anything not defined on the schema, so this
+    // can't inject arbitrary fields.
+    const payload = { ...req.body };
+    ['password', '_id', '__v', 'createdAt', 'updatedAt', 'designationHistory'].forEach(
+      (k) => delete payload[k]
+    );
+    // Treat empty strings as "not provided" so schema defaults/nulls apply and
+    // Date/Number fields (e.g. dateOfBirth, joining_date) don't fail casting.
+    Object.keys(payload).forEach((k) => { if (payload[k] === '') delete payload[k]; });
+
+    const user = await User.create({ ...payload, password: hashedPassword });
 
     // Return user without password
     const userObj = user.toObject();
