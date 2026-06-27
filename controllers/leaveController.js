@@ -59,9 +59,10 @@ const applyLeave = async (req, res) => {
     if (overlap)
       return res.status(409).json({ success: false, message: 'You already have a leave request overlapping these dates' });
 
-    // ── Upload any attached files to Cloudinary ──────────────────────────────
-    // multer (memoryStorage) puts files on req.files. Each is uploaded and we
-    // keep { name, url, type } — the shape Leave.documents expects.
+    // ── Build the documents array (always normalized to { name, url, type }) ──
+    // Source 1: files uploaded via multipart (req.files) → upload to Cloudinary.
+    // Source 2: a `documents` field in the body (already-uploaded objects, or a
+    //           JSON string, or plain URL strings) — normalized to the schema shape.
     let documents = [];
     if (Array.isArray(req.files) && req.files.length > 0) {
       try {
@@ -75,6 +76,19 @@ const applyLeave = async (req, res) => {
           message: 'Failed to upload supporting document(s). Please try again.',
         });
       }
+    } else if (req.body.documents) {
+      let raw = req.body.documents;
+      if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch { raw = [raw]; }
+      }
+      const arr = Array.isArray(raw) ? raw : [raw];
+      documents = arr
+        .map((d) =>
+          typeof d === 'string'
+            ? { name: d.split('/').pop() || 'attachment', url: d, type: null }
+            : { name: d?.name ?? null, url: d?.url ?? null, type: d?.type ?? null }
+        )
+        .filter((d) => d.url); // keep only entries that actually have a URL
     }
 
     const leave = await Leave.create({
