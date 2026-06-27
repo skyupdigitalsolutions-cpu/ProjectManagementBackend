@@ -65,33 +65,17 @@ const getAllPolicies = async (req, res) => {
 
 const createPolicy = async (req, res) => {
   try {
-    const {
-      title,
-      work_start_time,
-      work_end_time,
-      daily_hours,
-      late_grace_minutes,
-      leave_entitlements,
-      wfh_allowed,
-      wfh_days_per_month,
-      wfh_requires_approval,
-      holidays,
-    } = req.body;
+    // Accept every policy field the form sends (Mongoose strict mode drops
+    // anything not on the schema), minus computed/protected keys.
+    const payload = { ...req.body };
+    ['_id', '__v', 'createdAt', 'updatedAt', 'created_by'].forEach((k) => delete payload[k]);
 
     // Deactivate all existing policies
     await Policy.updateMany({}, { $set: { is_active: false } });
 
     const policy = await Policy.create({
-      title,
-      work_start_time,
-      work_end_time,
-      daily_hours,
-      late_grace_minutes,
-      leave_entitlements,
-      wfh_allowed,
-      wfh_days_per_month,
-      wfh_requires_approval,
-      holidays:   holidays ?? [],
+      ...payload,
+      holidays:   payload.holidays ?? [],
       is_active:  true,
       created_by: req.user._id,
     });
@@ -149,7 +133,7 @@ const updatePolicy = async (req, res) => {
 
 const addHoliday = async (req, res) => {
   try {
-    const { date, name, description } = req.body;
+    const { date, name, description, is_optional } = req.body;
 
     if (!date || !name) {
       return res.status(400).json({ success: false, message: 'date and name are required' });
@@ -173,7 +157,7 @@ const addHoliday = async (req, res) => {
       return res.status(409).json({ success: false, message: 'A holiday already exists on this date' });
     }
 
-    policy.holidays.push({ date: holidayDate, name: name.trim(), description: description?.trim() || null });
+    policy.holidays.push({ date: holidayDate, name: name.trim(), description: description?.trim() || null, is_optional: !!is_optional });
     policy.holidays.sort((a, b) => new Date(a.date) - new Date(b.date));
     await policy.save();
 
