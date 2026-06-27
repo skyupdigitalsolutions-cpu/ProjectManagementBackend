@@ -9,6 +9,15 @@ const RawLogSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// One break taken during the day (app-recorded). `end` is null while on break.
+const BreakSchema = new mongoose.Schema(
+  {
+    start: { type: Date, required: true },
+    end:   { type: Date, default: null },
+  },
+  { _id: true }
+);
+
 const AttendanceSchema = mongoose.Schema(
   {
     user_id: {
@@ -32,6 +41,16 @@ const AttendanceSchema = mongoose.Schema(
     hours_worked: {
       type: Number,
       default: null,
+      min: 0,
+    },
+    // Breaks taken through the application during the work session.
+    breaks: {
+      type: [BreakSchema],
+      default: [],
+    },
+    break_minutes: {
+      type: Number,
+      default: 0,
       min: 0,
     },
     status: {

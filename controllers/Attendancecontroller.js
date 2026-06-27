@@ -61,6 +61,12 @@ const evaluateManualClock = async (user) => {
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
 
+/** Total completed-break time, in whole minutes, for a breaks array */
+const sumBreakMinutes = (breaks = []) =>
+  Math.round(
+    breaks.reduce((acc, b) => (b.start && b.end ? acc + (new Date(b.end) - new Date(b.start)) : acc), 0) / 60000
+  );
+
 /**
  * Derives attendance status from clock-in time.
  * Work start = 09:00. Late threshold = 09:15. Half-day < 4 hours.
@@ -143,7 +149,12 @@ const clockOut = async (req, res) => {
     }
 
     const now = new Date();
-    const hours_worked = calcHours(record.clock_in, now);
+
+    // Auto-close any break left open, then total the break time.
+    record.breaks.forEach((b) => { if (!b.end) b.end = now; });
+    record.break_minutes = sumBreakMinutes(record.breaks);
+
+    const hours_worked = calcHours(record.clock_in, now);   // gross; net = gross − breaks
     const status = deriveStatus(record.clock_in, now);
 
     record.clock_out = now;
@@ -152,6 +163,63 @@ const clockOut = async (req, res) => {
     await record.save();
 
     return res.status(200).json({ success: true, message: "Clocked out successfully", data: record });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+// ─── BREAKS (app-recorded) ───────────────────────────────────────────────────
+
+/**
+ * POST /attendance/break/start
+ * Starts a break on today's attendance record. Works on top of any attendance
+ * source (manual, WFH, or biometric) as long as the user has clocked in and not
+ * yet clocked out. Breaks are always taken through the application.
+ */
+const startBreak = async (req, res) => {
+  try {
+    const record = await Attendance.findOne({ user_id: req.user._id, date: toMidnight() });
+
+    if (!record || !record.clock_in) {
+      return res.status(400).json({ success: false, message: "No attendance record for today yet — you can take a break once you're clocked in." });
+    }
+    if (record.clock_out) {
+      return res.status(400).json({ success: false, message: "You've already clocked out for today." });
+    }
+    if (record.breaks.some((b) => !b.end)) {
+      return res.status(400).json({ success: false, message: "You're already on a break." });
+    }
+
+    record.breaks.push({ start: new Date() });
+    await record.save();
+
+    return res.status(200).json({ success: true, message: "Break started", data: record });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+/**
+ * PATCH /attendance/break/end
+ * Ends the currently-open break on today's record.
+ */
+const endBreak = async (req, res) => {
+  try {
+    const record = await Attendance.findOne({ user_id: req.user._id, date: toMidnight() });
+
+    if (!record) {
+      return res.status(400).json({ success: false, message: "No attendance record for today." });
+    }
+    const open = record.breaks.find((b) => !b.end);
+    if (!open) {
+      return res.status(400).json({ success: false, message: "You're not currently on a break." });
+    }
+
+    open.end = new Date();
+    record.break_minutes = sumBreakMinutes(record.breaks);
+    await record.save();
+
+    return res.status(200).json({ success: true, message: "Break ended", data: record });
   } catch (error) {
     return handleError(res, error);
   }
@@ -461,6 +529,8 @@ const getMonthlySummary = async (req, res) => {
 module.exports = {
   clockIn,
   clockOut,
+  startBreak,
+  endBreak,
   getTodayStatus,
   getMyAttendance,
   getUserAttendance,

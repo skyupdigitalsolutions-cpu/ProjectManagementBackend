@@ -4,6 +4,8 @@ const router = express.Router();
 const {
   clockIn,
   clockOut,
+  startBreak,
+  endBreak,
   getTodayStatus,
   getMyAttendance,
   getUserAttendance,
@@ -17,6 +19,8 @@ const { protect, authorise } = require("../middleware/authMiddleware");
 
 router.post("/clock-in",              protect, clockIn);
 router.patch("/clock-out",            protect, clockOut);
+router.post("/break/start",           protect, startBreak);
+router.patch("/break/end",            protect, endBreak);
 router.get("/today",                  protect, getTodayStatus);
 router.get("/my",                     protect, getMyAttendance);
 router.post("/mark-absent",           protect, authorise("admin", "manager"), markAbsent);
