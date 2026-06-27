@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const Attendance = require("../models/attendance");
+const WfhRequest = require("../models/WfhRequest");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -15,6 +16,45 @@ const toMidnight = (date = new Date()) => {
   const d = new Date(date);
   d.setHours(0, 0, 0, 0);
   return d;
+};
+
+/** Returns a Date at the last moment (23:59:59.999) of the given day */
+const endOfDay = (date = new Date()) => {
+  const d = new Date(date);
+  d.setHours(23, 59, 59, 999);
+  return d;
+};
+
+/**
+ * Finds an APPROVED WFH request whose [from_date, to_date] window covers `when`.
+ * Overlap test handles inclusive day ranges regardless of stored time-of-day.
+ */
+const getActiveWfh = (userId, when = new Date()) =>
+  WfhRequest.findOne({
+    user_id:   userId,
+    status:    "approved",
+    from_date: { $lte: endOfDay(when) },
+    to_date:   { $gte: toMidnight(when) },
+  }).sort({ from_date: -1 });
+
+/**
+ * Decides whether a user may clock in/out manually through the app.
+ * Default: NO — attendance comes from the eSSL biometric machine.
+ * Allowed only when an approved WFH window covers today, or an admin has set
+ * attendance_override on the user.
+ */
+const evaluateManualClock = async (user) => {
+  if (user.attendance_override) {
+    return { allowed: true, via: "override", wfh: null };
+  }
+  const wfh = await getActiveWfh(user._id);
+  if (wfh) return { allowed: true, via: "wfh", wfh };
+  return {
+    allowed: false,
+    via:     null,
+    wfh:     null,
+    reason:  "Attendance is recorded by the biometric machine. Manual clock-in is only available during an approved work-from-home period — submit a WFH request and wait for admin approval.",
+  };
 };
 
 /** Calculates hours between two Date objects, rounded to 2 decimal places */
@@ -51,6 +91,12 @@ const clockIn = async (req, res) => {
     const now = new Date();
     const today = toMidnight(now);
 
+    // Manual clock-in is disabled unless an approved WFH window covers today.
+    const elig = await evaluateManualClock(req.user);
+    if (!elig.allowed) {
+      return res.status(403).json({ success: false, message: elig.reason });
+    }
+
     const existing = await Attendance.findOne({ user_id, date: today });
     if (existing) {
       return res.status(400).json({ success: false, message: "Already clocked in for today" });
@@ -63,6 +109,7 @@ const clockIn = async (req, res) => {
       date: today,
       clock_in: now,
       status,
+      source: elig.via === "wfh" ? "wfh" : "manual",
     });
 
     return res.status(201).json({ success: true, message: "Clocked in successfully", data: record });
@@ -86,6 +133,10 @@ const clockOut = async (req, res) => {
 
     if (!record) {
       return res.status(404).json({ success: false, message: "No clock-in record found for today" });
+    }
+    // Machine-managed records are closed by the eSSL device, not the app.
+    if (record.source === "fingerprint") {
+      return res.status(403).json({ success: false, message: "This record is managed by the biometric machine and cannot be edited from the app." });
     }
     if (record.clock_out) {
       return res.status(400).json({ success: false, message: "Already clocked out for today" });
@@ -119,11 +170,20 @@ const getTodayStatus = async (req, res) => {
       date: toMidnight(),
     });
 
-    if (!record) {
-      return res.status(200).json({ success: true, data: null, message: "Not clocked in yet today" });
-    }
+    // Tell the client whether manual clock controls should be enabled today.
+    const elig = await evaluateManualClock(req.user);
+    const activeWfh = elig.wfh
+      ? { from_date: elig.wfh.from_date, to_date: elig.wfh.to_date, reason: elig.wfh.reason }
+      : null;
 
-    return res.status(200).json({ success: true, data: record });
+    return res.status(200).json({
+      success: true,
+      data: record ?? null,
+      can_manual_clock: elig.allowed,
+      clock_mode: elig.via,          // "wfh" | "override" | null
+      active_wfh: activeWfh,
+      message: record ? undefined : "Not clocked in yet today",
+    });
   } catch (error) {
     return handleError(res, error);
   }

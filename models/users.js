@@ -120,6 +120,19 @@ const UserSchema = mongoose.Schema(
       trim: true,
     },
 
+    // ── Work mode / attendance ────────────────────────────────────────────────
+    // work_mode is informational; attendance_override is an admin "always allow
+    // manual clock" escape hatch (normally manual clock is gated by approved WFH).
+    work_mode: {
+      type: String,
+      enum: ['office', 'wfh', 'hybrid'],
+      default: 'office',
+    },
+    attendance_override: {
+      type: Boolean,
+      default: false,
+    },
+
     // ── Personal ──────────────────────────────────────────────────────────────
     dateOfBirth:      { type: Date,   default: null },
     gender:           { type: String, default: null, trim: true },

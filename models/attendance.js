@@ -43,8 +43,8 @@ const AttendanceSchema = mongoose.Schema(
     // ─── eSSL Fingerprint Machine Integration ──────────────────────────────
     source: {
       type: String,
-      enum: ["manual", "fingerprint"],
-      default: "manual",           // "fingerprint" = came from eSSL device
+      enum: ["manual", "fingerprint", "wfh"],
+      default: "manual",           // "fingerprint" = eSSL device · "wfh" = approved work-from-home
     },
     device_serial: {
       type: String,
