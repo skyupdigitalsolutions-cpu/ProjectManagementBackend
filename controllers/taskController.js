@@ -10,6 +10,7 @@
  */
 
 const Task         = require('../models/tasks');
+const User         = require('../models/users');
 const Notification = require('../models/notification');
 const mongoose     = require('mongoose');
 const eventBus     = require('../services/eventBus');
@@ -25,6 +26,40 @@ const handleError = (res, error, statusCode = 500) => {
 };
 
 const PRIORITY_SCORE = { critical: 100, high: 75, medium: 50, low: 25 };
+
+// ─── Role-based task visibility ────────────────────────────────────────────────
+//
+//   admin    → all tasks                        → {}
+//   manager  → tasks of employees in their own
+//              department + their own tasks      → { assigned_to: { $in: [...] } }
+//   employee → only tasks assigned to them       → { assigned_to: self }
+//
+// Returns a Mongo filter fragment to be merged into the main query / $match.
+async function buildTaskScope(user) {
+  if (user.role === 'admin') return {};
+
+  if (user.role === 'manager') {
+    const deptEmployees = await User.find({
+      department: user.department,
+      role:       'employee',
+    }).select('_id').lean();
+
+    const ids = deptEmployees.map((u) => u._id);
+    ids.push(user._id);                       // include the manager's own tasks
+    return { assigned_to: { $in: ids } };
+  }
+
+  // employee (and any non-privileged role) → own tasks only
+  return { assigned_to: user._id };
+}
+
+// True if `assigneeId` (string) is visible under the given scope fragment.
+function assigneeAllowed(scope, assigneeId) {
+  if (!scope.assigned_to) return true;        // admin: unrestricted
+  const a = scope.assigned_to;
+  if (a.$in) return a.$in.some((x) => x.toString() === assigneeId);
+  return a.toString() === assigneeId;
+}
 
 // ─── CREATE ───────────────────────────────────────────────────────────────────
 
@@ -110,7 +145,7 @@ const getAllTasks = async (req, res) => {
 
     const filter = {};
     if (project_id)  { if (!isValidObjectId(project_id))  return res.status(400).json({ success: false, message: 'Invalid project_id' });  filter.project_id  = project_id; }
-    if (assigned_to) { if (!isValidObjectId(assigned_to)) return res.status(400).json({ success: false, message: 'Invalid assigned_to' }); filter.assigned_to = assigned_to; }
+    if (assigned_to && !isValidObjectId(assigned_to)) return res.status(400).json({ success: false, message: 'Invalid assigned_to' });
     if (status)    filter.status   = status;
     if (priority)  filter.priority = priority;
     if (is_delayed !== undefined)         filter.is_delayed           = is_delayed === 'true';
@@ -119,6 +154,19 @@ const getAllTasks = async (req, res) => {
     if (required_role)       filter.required_role       = { $regex: required_role.trim(),       $options: 'i' };
     if (required_department) filter.required_department = { $regex: required_department.trim(), $options: 'i' };
     if (excel_import !== undefined) filter.excel_import = excel_import === 'true';
+
+    // ── Role-based visibility (admin: all · manager: dept + own · employee: own) ──
+    const scope = await buildTaskScope(req.user);
+    Object.assign(filter, scope);
+
+    // If a specific assignee was requested, it must fall inside the caller's scope.
+    if (assigned_to) {
+      if (!assigneeAllowed(scope, assigned_to)) {
+        // Caller asked for someone they're not allowed to see → empty result.
+        return res.status(200).json({ success: true, total: 0, page: Number(page), pages: 0, data: [] });
+      }
+      filter.assigned_to = assigned_to;       // narrow within the allowed scope
+    }
 
     const skip = (Number(page) - 1) * Number(limit);
     const [tasks, total] = await Promise.all([
@@ -161,6 +209,12 @@ const getTaskById = async (req, res) => {
 
     if (!task)
       return res.status(404).json({ success: false, message: 'Task not found' });
+
+    // Enforce the same visibility scope as the list view.
+    const scope = await buildTaskScope(req.user);
+    if (!assigneeAllowed(scope, task.assigned_to?.toString() ?? '')) {
+      return res.status(403).json({ success: false, message: 'Not authorised to view this task' });
+    }
 
     return res.status(200).json({ success: true, data: task });
   } catch (error) {
@@ -528,10 +582,8 @@ const reassignTask = async (req, res) => {
 
 const getTaskStats = async (req, res) => {
   try {
-    const matchFilter =
-      req.user.role === 'employee'
-        ? { assigned_to: req.user._id }
-        : {};
+    // admin → all · manager → dept employees + own · employee → own
+    const matchFilter = await buildTaskScope(req.user);
 
     const [byStatus, byPriority, delayed] = await Promise.all([
       Task.aggregate([{ $match: matchFilter }, { $group: { _id: '$status',   count: { $sum: 1 } } }]),
