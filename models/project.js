@@ -38,12 +38,16 @@ const ProjectSchema = mongoose.Schema(
     project_type: {
       type: String,
       enum: [
+        // ── Legacy values (kept so existing documents don't break) ─────────
         "website", "mobile_app", "ecommerce", "api_service",
         "data_analytics", "design", "content", "seo", "marketing",
         "admin_dashboard", "ai_features", "other",
-        // ── NEW aliases used by auto-task assignment ──────────────────────
         "Web Development", "Mobile Development", "Data Analytics",
         "UI/UX Design", "DevOps", "QA Testing", "Content Creation",
+        // ── Frontend PROJECT_TYPES (src/pages/admin/Projects.jsx) ──────────
+        "website_development", "graphic_design", "ui_ux_design",
+        "automation", "email_marketing", "branding", "machine_learning",
+        "google_ads", "role_based_dashboards",
       ],
       default: "other",
     },
@@ -52,9 +56,14 @@ const ProjectSchema = mongoose.Schema(
     project_types: {
       type: [String],
       enum: [
+        // ── Legacy values (kept so existing documents don't break) ─────────
         "website", "mobile_app", "ecommerce", "api_service",
         "data_analytics", "design", "content", "seo", "marketing",
         "admin_dashboard", "ai_features", "other",
+        // ── Frontend PROJECT_TYPES (src/pages/admin/Projects.jsx) ──────────
+        "website_development", "graphic_design", "ui_ux_design",
+        "automation", "email_marketing", "branding", "machine_learning",
+        "google_ads", "role_based_dashboards",
       ],
       default: [],
     },
