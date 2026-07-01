@@ -1,5 +1,3 @@
-
-
 const Task         = require("../models/tasks");
 const User         = require("../models/users");
 const Leave        = require("../models/leave");
@@ -21,29 +19,44 @@ const MAX_ACTIVE_TASKS = 5;
 
 // ─── STEP 1: Filter eligible employees for a role ─────────────────────────────
 
+// NOTE: previously this used Mongo `$regex` with the raw required_role /
+// required_department string as the pattern — that requires the LITERAL
+// phrase (e.g. "backend developer") to appear inside the employee's
+// designation, and the literal phrase "Web Development" to appear inside
+// their department. Real-world data rarely matches that exactly — e.g. a
+// designation of "Full Stack Web Developer" does not contain the substring
+// "backend developer" anywhere, and a department of "IT" does not contain
+// "Web Development" — so tasks were being marked "no eligible employee" and
+// left unassigned even when an obviously-qualified person existed. Fixed to
+// do word-overlap matching instead (same approach used by the frontend's
+// auto-assign panel and the round-robin fallback in Assignmentcontroller.js).
 async function getEligibleEmployees(required_role, required_department, taskStartDate) {
   const checkDate = taskStartDate ? new Date(taskStartDate) : new Date();
 
-  const orConditions = [];
-  if (required_role) {
-    orConditions.push({ designation: { $regex: required_role, $options: "i" } });
-  }
-  if (required_department) {
-    orConditions.push({ department: { $regex: required_department, $options: "i" } });
-  }
+  const wordsOf = (str = "") =>
+    String(str).toLowerCase().split(/[\s/\-_,]+/).filter((w) => w.length > 2);
 
-  const query = {
-    role:   "employee",
-    status: "active",
-    ...(orConditions.length ? { $or: orConditions } : {}),
-  };
+  const roleWords = wordsOf(required_role);
+  const deptWords  = wordsOf(required_department);
 
-  const candidates = await User.find(query).select(
+  // All active employees — filtering happens in JS below since fuzzy
+  // word-overlap isn't expressible as a single simple Mongo regex.
+  const candidates = await User.find({ role: "employee", status: "active" }).select(
     "_id name designation department status"
   );
 
+  const matched = candidates.filter((u) => {
+    const desig = (u.designation || "").toLowerCase();
+    const dept  = (u.department  || "").toLowerCase();
+
+    const designationMatch = roleWords.length > 0 && roleWords.some((w) => desig.includes(w));
+    const departmentMatch  = deptWords.length  > 0 && deptWords.some((w) => dept.includes(w));
+
+    return designationMatch || departmentMatch;
+  });
+
   const available = await Promise.all(
-    candidates.map(async (u) => {
+    matched.map(async (u) => {
       const onLeave = await Leave.findOne({
         user_id:   u._id,
         status:    "approved",

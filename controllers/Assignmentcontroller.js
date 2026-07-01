@@ -23,6 +23,62 @@ const handleError = (res, error, statusCode = 500) => {
   });
 };
 
+// ─── Fallback employee matcher ───────────────────────────────────────────────
+// Used whenever a task/subtask reaches the server with no assignee (e.g. the
+// wizard's optional "Auto-Assign Generated Tasks" panel wasn't run). Without
+// this, tasks silently land as "Unassigned" even when a clearly-qualified
+// person exists — e.g. a "backend developer" task with no literal Backend
+// Developer on staff, but a "Full Stack Web Developer" who should get it.
+//
+// Matching order:
+//   1. Designation contains any word from the required role (fuzzy — this is
+//      what lets "Full Stack Web Developer" match "backend developer" or
+//      "frontend developer" via the shared word "developer").
+//   2. Round-robin among employees in the matching department.
+//   3. Round-robin across every active employee (last resort, never leaves a
+//      task unassigned if at least one employee exists).
+const buildFallbackAssigner = (allEmployees) => {
+  const deptRoundRobin = {};
+
+  const deptMatches = (userDept, wantedDept) => {
+    if (!userDept || !wantedDept) return false;
+    const u = userDept.toLowerCase();
+    const w = wantedDept.toLowerCase();
+    if (u === w) return true;
+    if (u.includes(w) || w.includes(u)) return true;
+    const tokens = w.split(/[\s&,]+/).filter((t) => t.length > 2);
+    return tokens.some((tok) => u.includes(tok));
+  };
+
+  return (roleHint, deptHint) => {
+    const roleWords = (roleHint || "")
+      .split(/[\/\s,]+/)
+      .map((w) => w.toLowerCase().trim())
+      .filter((w) => w.length > 2);
+
+    if (roleWords.length > 0) {
+      const byRole = allEmployees.find((u) =>
+        roleWords.some((word) => u.designation?.toLowerCase().includes(word))
+      );
+      if (byRole) return byRole._id;
+    }
+
+    const deptEmps = allEmployees.filter((u) => deptMatches(u.department, deptHint));
+    if (deptEmps.length > 0) {
+      const key = deptHint || "__all__";
+      deptRoundRobin[key] = ((deptRoundRobin[key] ?? -1) + 1) % deptEmps.length;
+      return deptEmps[deptRoundRobin[key]]._id;
+    }
+
+    if (allEmployees.length > 0) {
+      deptRoundRobin.__global__ = ((deptRoundRobin.__global__ ?? -1) + 1) % allEmployees.length;
+      return allEmployees[deptRoundRobin.__global__]._id;
+    }
+
+    return null;
+  };
+};
+
 // ─── AUTO-PLAN PREVIEW ───────────────────────────────────────────────────────
 
 /**
@@ -312,13 +368,22 @@ const createProjectWizard = async (req, res) => {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // MODE C: FULLY MANUAL
+    // MODE C: FULLY MANUAL  (with fallback auto-assign for anything the
+    // wizard sent up as unassigned — see buildFallbackAssigner above)
     // ════════════════════════════════════════════════════════════════════
     const createdAssignments = [];
     const PRIORITY_SCORE     = { critical: 100, high: 75, medium: 50, low: 25 };
 
+    // Pre-load once — reused across every assignment/task/subtask below.
+    const allActiveEmployees = await User.find({
+      status: "active",
+      role: { $in: ["employee", "manager"] },
+    }).select("_id name designation department");
+    const fallbackAssign = buildFallbackAssigner(allActiveEmployees);
+
     for (const aData of assignmentsData) {
       const { members = [], tasks = [], ...assignmentFields } = aData;
+      const memberSet = new Set(members.map(String));
 
       const assignment = await Assignment.create({
         ...assignmentFields,
@@ -326,8 +391,31 @@ const createProjectWizard = async (req, res) => {
         project_id: project._id,
       });
 
-      if (members.length) {
-        const memberDocs = members.map((userId) => ({
+      // Resolve missing assignees BEFORE saving — a task/subtask that came in
+      // with no assigned_to gets the best-matching active employee instead of
+      // sitting as "Unassigned".
+      for (const t of tasks) {
+        if (!t.assigned_to) {
+          const picked = fallbackAssign(t.required_role, assignmentFields.department);
+          if (picked) {
+            t.assigned_to = picked;
+            memberSet.add(String(picked));
+          }
+        }
+        for (const st of t.subtasks || []) {
+          if (!st.assigned_to) {
+            const picked = fallbackAssign(st.required_role || t.required_role, assignmentFields.department);
+            if (picked) {
+              st.assigned_to = picked;
+              memberSet.add(String(picked));
+            }
+          }
+        }
+      }
+
+      const memberIds = Array.from(memberSet);
+      if (memberIds.length) {
+        const memberDocs = memberIds.map((userId) => ({
           assignment_id: assignment._id,
           user_id: userId,
         }));
@@ -335,7 +423,7 @@ const createProjectWizard = async (req, res) => {
           if (e.code !== 11000) throw e;
         });
 
-        const projMemberDocs = members.map((userId) => ({
+        const projMemberDocs = memberIds.map((userId) => ({
           project_id:      project._id,
           user_id:         userId,
           role_in_project: "developer",
