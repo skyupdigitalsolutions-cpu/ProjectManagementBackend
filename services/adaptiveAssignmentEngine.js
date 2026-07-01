@@ -17,40 +17,42 @@ const WORKLOAD_DEADLINE_MULTIPLIER = {
 
 const MAX_ACTIVE_TASKS = 5;
 
+const { designationMatchesRole } = require("./roleMatching");
+
 // ─── STEP 1: Filter eligible employees for a role ─────────────────────────────
 
 // NOTE: previously this used Mongo `$regex` with the raw required_role /
 // required_department string as the pattern — that requires the LITERAL
 // phrase (e.g. "backend developer") to appear inside the employee's
 // designation, and the literal phrase "Web Development" to appear inside
-// their department. Real-world data rarely matches that exactly — e.g. a
-// designation of "Full Stack Web Developer" does not contain the substring
-// "backend developer" anywhere, and a department of "IT" does not contain
-// "Web Development" — so tasks were being marked "no eligible employee" and
-// left unassigned even when an obviously-qualified person existed. Fixed to
-// do word-overlap matching instead (same approach used by the frontend's
-// auto-assign panel and the round-robin fallback in Assignmentcontroller.js).
+// their department. Real-world data rarely matches that exactly, so tasks
+// were being marked "no eligible employee" and left unassigned even when an
+// obviously-qualified person existed.
+//
+// The FIRST fix (generic word-overlap, e.g. matching on the shared word
+// "developer") was too loose in the other direction — it let an "AI
+// Developer" pick up backend/frontend web tasks just because their title
+// also contains the word "developer". Now uses the explicit designation
+// families in `./roleMatching` — e.g. "backend developer" only matches
+// Backend/Full-Stack designations, never AI/ML, marketing, etc.
 async function getEligibleEmployees(required_role, required_department, taskStartDate) {
   const checkDate = taskStartDate ? new Date(taskStartDate) : new Date();
 
   const wordsOf = (str = "") =>
     String(str).toLowerCase().split(/[\s/\-_,]+/).filter((w) => w.length > 2);
-
-  const roleWords = wordsOf(required_role);
-  const deptWords  = wordsOf(required_department);
+  const deptWords = wordsOf(required_department);
 
   // All active employees — filtering happens in JS below since fuzzy
-  // word-overlap isn't expressible as a single simple Mongo regex.
+  // family/word matching isn't expressible as a single simple Mongo regex.
   const candidates = await User.find({ role: "employee", status: "active" }).select(
     "_id name designation department status"
   );
 
   const matched = candidates.filter((u) => {
-    const desig = (u.designation || "").toLowerCase();
-    const dept  = (u.department  || "").toLowerCase();
+    const dept = (u.department || "").toLowerCase();
 
-    const designationMatch = roleWords.length > 0 && roleWords.some((w) => desig.includes(w));
-    const departmentMatch  = deptWords.length  > 0 && deptWords.some((w) => dept.includes(w));
+    const designationMatch = designationMatchesRole(u.designation, required_role);
+    const departmentMatch  = deptWords.length > 0 && deptWords.some((w) => dept.includes(w));
 
     return designationMatch || departmentMatch;
   });

@@ -23,6 +23,8 @@ const handleError = (res, error, statusCode = 500) => {
   });
 };
 
+const { designationMatchesRole } = require("../services/roleMatching");
+
 // ─── Fallback employee matcher ───────────────────────────────────────────────
 // Used whenever a task/subtask reaches the server with no assignee (e.g. the
 // wizard's optional "Auto-Assign Generated Tasks" panel wasn't run). Without
@@ -31,13 +33,18 @@ const handleError = (res, error, statusCode = 500) => {
 // Developer on staff, but a "Full Stack Web Developer" who should get it.
 //
 // Matching order:
-//   1. Designation contains any word from the required role (fuzzy — this is
-//      what lets "Full Stack Web Developer" match "backend developer" or
-//      "frontend developer" via the shared word "developer").
-//   2. Round-robin among employees in the matching department.
+//   1. Round-robin among employees whose designation is in an allowed family
+//      for this role — see services/roleMatching.js. This is deliberately
+//      NOT plain "shares a word" matching: that would let an "AI Developer"
+//      pick up backend/frontend web tasks just because their title also
+//      contains the word "developer". Family rules keep web-dev tasks
+//      strictly within Backend/Frontend/Full-Stack designations.
+//   2. Round-robin among employees in the matching department (fallback for
+//      roles with no explicit family rule).
 //   3. Round-robin across every active employee (last resort, never leaves a
 //      task unassigned if at least one employee exists).
 const buildFallbackAssigner = (allEmployees) => {
+  const roleRoundRobin = {};
   const deptRoundRobin = {};
 
   const deptMatches = (userDept, wantedDept) => {
@@ -51,16 +58,11 @@ const buildFallbackAssigner = (allEmployees) => {
   };
 
   return (roleHint, deptHint) => {
-    const roleWords = (roleHint || "")
-      .split(/[\/\s,]+/)
-      .map((w) => w.toLowerCase().trim())
-      .filter((w) => w.length > 2);
-
-    if (roleWords.length > 0) {
-      const byRole = allEmployees.find((u) =>
-        roleWords.some((word) => u.designation?.toLowerCase().includes(word))
-      );
-      if (byRole) return byRole._id;
+    const roleEmps = allEmployees.filter((u) => designationMatchesRole(u.designation, roleHint));
+    if (roleEmps.length > 0) {
+      const key = roleHint || "__role__";
+      roleRoundRobin[key] = ((roleRoundRobin[key] ?? -1) + 1) % roleEmps.length;
+      return roleEmps[roleRoundRobin[key]]._id;
     }
 
     const deptEmps = allEmployees.filter((u) => deptMatches(u.department, deptHint));
@@ -812,24 +814,23 @@ const autoAssignForProject = async (req, res) => {
       return tokens.some(tok => u.includes(tok));
     };
 
-    // Round-robin counters per dept so tasks spread evenly across employees
+    // Round-robin counters so tasks spread evenly across matching employees
+    const roleRoundRobin = {};
     const deptRoundRobin = {};
 
-    // Helper: pick best employee — designation match first, then round-robin within dept,
-    // then any employee. NEVER falls back to admin.
+    // Helper: pick best employee — designation-family match first (round-robin
+    // across everyone in that family, e.g. Full Stack Web Developer), then
+    // round-robin within dept, then any employee. NEVER falls back to admin.
+    // Uses services/roleMatching.js so "backend developer" / "frontend
+    // developer" tasks only ever land on Backend/Frontend/Full-Stack
+    // designations — never AI Developer or unrelated titles that happen to
+    // also contain the word "developer".
     const pickEmployee = (roleHint, deptName) => {
-      // Build role keywords — handle "UI/UX Designer" → ["UI", "UX", "Designer"]
-      const roleWords = (roleHint || '')
-        .split(/[\/\s,]+/)
-        .map(w => w.toLowerCase().trim())
-        .filter(w => w.length > 2);
-
-      // 1. Designation match on any role word
-      if (roleWords.length > 0) {
-        const byRole = allEmployees.find(u =>
-          roleWords.some(word => u.designation?.toLowerCase().includes(word))
-        );
-        if (byRole) return byRole._id;
+      const roleEmps = allEmployees.filter(u => designationMatchesRole(u.designation, roleHint));
+      if (roleEmps.length > 0) {
+        const key = roleHint || '__role__';
+        roleRoundRobin[key] = ((roleRoundRobin[key] ?? -1) + 1) % roleEmps.length;
+        return roleEmps[roleRoundRobin[key]]._id;
       }
 
       // 2. Round-robin among employees in the same department
