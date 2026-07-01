@@ -688,6 +688,7 @@ const autoAssignForProject = async (req, res) => {
       'Planning': 'HR & Admin',
       'Design':   'Graphic Design',
       'Development': 'Web Design & Development',
+      'Testing':  'Testing',
       'Marketing': 'Performance Marketing',
       'Optimization': 'SEO',
       'Launch':    'Web Design & Development',

@@ -1,4 +1,3 @@
-
 const DEFAULT_DAILY_HOURS = 8;
 
 // ─── Assignment Type → Subtask Templates ────────────────────────────────────
@@ -275,35 +274,45 @@ function getSupportedTypes() {
 }
 
 // ─── PROJECT TYPE → ASSIGNMENT TYPE MAPPING ───────────────────────────────────
+// NOTE: keys MUST match the `value` fields in the frontend's PROJECT_TYPES list
+// (src/pages/admin/Projects.jsx). Previously these keys used old names
+// (e.g. "website", "design", "marketing") that no longer match what the
+// frontend actually sends (e.g. "website_development", "graphic_design",
+// "email_marketing") — that mismatch meant "Generate Task Plan" silently
+// produced almost nothing for most project types. Fixed below.
 const PROJECT_TYPE_TO_ASSIGNMENT_TYPE = {
-  website:          ['Design', 'Development', 'Testing'],
-  mobile_app:       ['Design', 'Development', 'Testing'],
-  admin_dashboard:  ['Design', 'Development', 'Testing'],
-  ecommerce:        ['Design', 'Development', 'Testing'],
-  api_service:      ['Development', 'Testing'],
-  ai_features:      ['Development', 'Testing'],
-  design:           ['Design'],
-  marketing:        ['Marketing'],
-  seo:              ['Marketing'],
-  content:          ['Marketing'],
-  data_analytics:   ['Development', 'Testing'],
-  other:            ['Development', 'Testing'],
+  website_development:   ['Design', 'Development', 'Testing'],
+  mobile_app:             ['Design', 'Development', 'Testing'],
+  role_based_dashboards:  ['Design', 'Development', 'Testing'],
+  automation:             ['Development', 'Testing'],
+  machine_learning:       ['Development', 'Testing'],
+  graphic_design:         ['Design'],
+  ui_ux_design:           ['Design'],
+  branding:               ['Design'],
+  seo:                    ['Marketing'],
+  email_marketing:        ['Marketing'],
+  google_ads:             ['Marketing'],
+  other:                  ['Development', 'Testing'],
 };
 
 // ─── PHASE-BASED PARALLEL PLAN GENERATOR ─────────────────────────────────────
 /**
- * Generate a unified, phase-based project plan for multiple project types.
- * Tasks within each phase are organized for maximum parallel execution.
+ * Generate a unified, phase-based, GRANULAR project plan for multiple project
+ * types. Development and design work is broken down into individual,
+ * assignable units (one task per page / module / deliverable) rather than
+ * one lumped "Development" task — this is what lets 2-3 people with the same
+ * designation (e.g. 3 Full Stack Developers) actually split the work between
+ * frontend / backend / feature areas instead of all landing on one person.
  *
  * PHASE STRUCTURE:
  *  Phase 1: Planning & Research      — kickoff, research, strategy (all parallel)
- *  Phase 2: Design & Strategy        — UI/UX design + SEO research + marketing strategy (parallel)
- *  Phase 3: Development & Setup      — backend, frontend, content creation (parallel streams)
- *  Phase 4: Marketing & Optimization — campaigns, SEO implementation, testing (parallel)
- *  Phase 5: Launch & Monitoring      — deployment, UAT, go-live (sequential handoff)
+ *  Phase 2: Design & Strategy        — UI/UX, branding, content/marketing strategy
+ *  Phase 3: Development & Build      — granular frontend/backend/feature tasks
+ *  Phase 4: Testing & QA             — functional, performance, UAT prep
+ *  Phase 5: Launch & Monitoring      — deployment, go-live, post-launch
  *
- * @param {string[]} projectTypes - e.g. ['website', 'seo', 'marketing']
- * @param {string}   description  - project description / requirements text
+ * @param {string[]} projectTypes - e.g. ['website_development', 'seo']
+ * @param {string}   description  - project description / requirements text (unused for now, kept for future NLP-based customization)
  * @returns {{ phases: PhaseObject[] }}
  */
 function generateUnifiedProjectPlan(projectTypes = [], description = '') {
@@ -311,16 +320,40 @@ function generateUnifiedProjectPlan(projectTypes = [], description = '') {
     projectTypes = ['other'];
   }
 
-  const hasWebsite    = projectTypes.some(t => ['website','mobile_app','admin_dashboard','ecommerce'].includes(t));
-  const hasDev        = projectTypes.some(t => ['website','mobile_app','admin_dashboard','ecommerce','api_service','ai_features','data_analytics','other'].includes(t));
-  const hasDesign     = projectTypes.some(t => ['website','mobile_app','admin_dashboard','ecommerce','design'].includes(t));
-  const hasSEO        = projectTypes.some(t => ['seo'].includes(t));
-  const hasMarketing  = projectTypes.some(t => ['marketing','seo','content'].includes(t));
-  const hasTesting    = projectTypes.some(t => ['website','mobile_app','admin_dashboard','ecommerce','api_service','ai_features','data_analytics','other'].includes(t));
+  const has = (type) => projectTypes.includes(type);
 
-  // ── Phase 1: Planning & Research ─────────────────────────────────────────
+  const hasWebsite    = has('website_development');
+  const hasMobile     = has('mobile_app');
+  const hasDashboard  = has('role_based_dashboards');
+  const hasAutomation = has('automation');
+  const hasML         = has('machine_learning');
+  const hasGraphic    = has('graphic_design');
+  const hasUIUX       = has('ui_ux_design');
+  const hasBranding   = has('branding');
+  const hasSEO        = has('seo');
+  const hasEmail      = has('email_marketing');
+  const hasGoogleAds  = has('google_ads');
+  const hasOther      = has('other') || projectTypes.length === 0;
+
+  // "Build" projects need a dev pipeline (frontend/backend/feature work + testing).
+  const hasBuildProject = hasWebsite || hasMobile || hasDashboard || hasAutomation || hasML || hasOther;
+  // "Design-only" projects (no code being written).
+  const hasDesignOnly   = hasGraphic || hasUIUX || hasBranding;
+  // Any marketing-flavoured work.
+  const hasMarketingAny = hasSEO || hasEmail || hasGoogleAds;
+  // UI/UX design work is needed both for design-only UI/UX projects AND as a
+  // pre-step for anything with screens (website/mobile/dashboard).
+  const needsUIUXWork   = hasUIUX || hasWebsite || hasMobile || hasDashboard;
+
   const phase1Tasks = [];
+  const phase2Tasks = [];
+  const phase3Tasks = [];
+  const phase4Tasks = [];
+  const phase5Tasks = [];
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // PHASE 1: PLANNING & RESEARCH
+  // ═══════════════════════════════════════════════════════════════════════
   phase1Tasks.push({
     title: "Project Kickoff & Scope Definition",
     role: "Project Manager",
@@ -330,40 +363,29 @@ function generateUnifiedProjectPlan(projectTypes = [], description = '') {
     canRunParallel: false,
   });
 
-  if (hasDesign || hasWebsite) {
+  if (needsUIUXWork) {
     phase1Tasks.push({
       title: "UX Research & User Personas",
-      role: "UX Designer",
-      duration: "3 days",
+      role: "UI/UX Designer",
+      duration: "2 days",
       priority: "High",
       dependency: "Project Kickoff & Scope Definition",
       canRunParallel: true,
     });
   }
 
-  if (hasSEO || hasMarketing) {
+  if (hasWebsite) {
     phase1Tasks.push({
-      title: "SEO Keyword Research & Audit",
-      role: "SEO Specialist",
-      duration: "3 days",
+      title: "Sitemap & Content Inventory (Pages List)",
+      role: "UI/UX Designer",
+      duration: "1 day",
       priority: "High",
       dependency: "Project Kickoff & Scope Definition",
       canRunParallel: true,
     });
   }
 
-  if (hasMarketing) {
-    phase1Tasks.push({
-      title: "Market Research & Competitor Analysis",
-      role: "Marketing Specialist",
-      duration: "3 days",
-      priority: "High",
-      dependency: "Project Kickoff & Scope Definition",
-      canRunParallel: true,
-    });
-  }
-
-  if (hasDev) {
+  if (hasBuildProject) {
     phase1Tasks.push({
       title: "Technical Architecture Planning",
       role: "Backend Developer",
@@ -374,20 +396,75 @@ function generateUnifiedProjectPlan(projectTypes = [], description = '') {
     });
   }
 
-  // ── Phase 2: Design & Strategy ────────────────────────────────────────────
-  const phase2Tasks = [];
+  if (hasAutomation) {
+    phase1Tasks.push({
+      title: "Process Mapping & Requirements Gathering",
+      role: "Automation Engineer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+  }
 
-  if (hasDesign) {
+  if (hasML) {
+    phase1Tasks.push({
+      title: "Data Requirements & Feasibility Study",
+      role: "ML Engineer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasBranding) {
+    phase1Tasks.push({
+      title: "Brand Discovery & Positioning Workshop",
+      role: "Brand Strategist",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasSEO || hasGoogleAds) {
+    phase1Tasks.push({
+      title: "Keyword & Competitor Research",
+      role: hasSEO ? "SEO Specialist" : "Google Ads Specialist",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasEmail) {
+    phase1Tasks.push({
+      title: "Audience Segmentation & List Strategy",
+      role: "Email Marketing Specialist",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PHASE 2: DESIGN & STRATEGY
+  // ═══════════════════════════════════════════════════════════════════════
+  if (needsUIUXWork) {
     phase2Tasks.push({
       title: "Wireframing & User Flow Design",
       role: "UI/UX Designer",
-      duration: "4 days",
+      duration: "3 days",
       priority: "High",
       dependency: "UX Research & User Personas",
       canRunParallel: true,
     });
     phase2Tasks.push({
-      title: "UI Design – Screens & Components",
+      title: "High-Fidelity UI Mockups (All Screens)",
       role: "UI/UX Designer",
       duration: "5 days",
       priority: "High",
@@ -397,251 +474,737 @@ function generateUnifiedProjectPlan(projectTypes = [], description = '') {
     phase2Tasks.push({
       title: "Design System & Style Guide",
       role: "UI/UX Designer",
-      duration: "3 days",
+      duration: "2 days",
       priority: "Medium",
       dependency: "Wireframing & User Flow Design",
       canRunParallel: true,
     });
+    if (hasUIUX) {
+      phase2Tasks.push({
+        title: "Interactive Prototype",
+        role: "UI/UX Designer",
+        duration: "2 days",
+        priority: "Medium",
+        dependency: "High-Fidelity UI Mockups (All Screens)",
+        canRunParallel: true,
+      });
+      phase2Tasks.push({
+        title: "Usability Testing & Iteration",
+        role: "UI/UX Designer",
+        duration: "2 days",
+        priority: "Medium",
+        dependency: "Interactive Prototype",
+        canRunParallel: false,
+      });
+      phase2Tasks.push({
+        title: "Design Handoff (Specs, Assets, Style Guide)",
+        role: "UI/UX Designer",
+        duration: "1 day",
+        priority: "Low",
+        dependency: "Usability Testing & Iteration",
+        canRunParallel: false,
+      });
+    }
   }
 
-  if (hasSEO || hasMarketing) {
+  if (hasGraphic) {
+    phase2Tasks.push({
+      title: "Design Brief & Moodboarding",
+      role: "Graphic Designer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Project Kickoff & Scope Definition",
+      canRunParallel: true,
+    });
+    phase2Tasks.push({
+      title: "Concept Design – Initial Drafts",
+      role: "Graphic Designer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Design Brief & Moodboarding",
+      canRunParallel: false,
+    });
+    phase2Tasks.push({
+      title: "Revisions & Refinement",
+      role: "Graphic Designer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Concept Design – Initial Drafts",
+      canRunParallel: false,
+    });
+    phase2Tasks.push({
+      title: "Final Artwork & Export (All Formats)",
+      role: "Graphic Designer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Revisions & Refinement",
+      canRunParallel: false,
+    });
+  }
+
+  if (hasBranding) {
+    phase2Tasks.push({
+      title: "Logo Concepts & Exploration",
+      role: "Graphic Designer",
+      duration: "3 days",
+      priority: "High",
+      dependency: "Brand Discovery & Positioning Workshop",
+      canRunParallel: true,
+    });
+    phase2Tasks.push({
+      title: "Logo Refinement & Finalization",
+      role: "Graphic Designer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Logo Concepts & Exploration",
+      canRunParallel: false,
+    });
+    phase2Tasks.push({
+      title: "Color Palette & Typography System",
+      role: "Graphic Designer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Logo Refinement & Finalization",
+      canRunParallel: true,
+    });
+    phase2Tasks.push({
+      title: "Brand Guidelines Document",
+      role: "Graphic Designer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Color Palette & Typography System",
+      canRunParallel: false,
+    });
+    phase2Tasks.push({
+      title: "Brand Collateral (Business Cards, Letterhead, Social Kit)",
+      role: "Graphic Designer",
+      duration: "2 days",
+      priority: "Low",
+      dependency: "Brand Guidelines Document",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasMarketingAny) {
     phase2Tasks.push({
       title: "Content Strategy & Editorial Plan",
-      role: hasSEO && hasMarketing ? "SEO & Content Specialist" : (hasSEO ? "SEO Specialist" : "Content Writer"),
-      duration: "3 days",
-      priority: "High",
-      dependency: hasSEO ? "SEO Keyword Research & Audit" : "Market Research & Competitor Analysis",
+      role: "Content Writer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: hasSEO ? "Keyword & Competitor Research" : "Project Kickoff & Scope Definition",
       canRunParallel: true,
     });
   }
 
-  if (hasMarketing) {
-    phase2Tasks.push({
-      title: "Campaign Strategy & KPI Definition",
-      role: "Marketing Specialist",
+  // ═══════════════════════════════════════════════════════════════════════
+  // PHASE 3: DEVELOPMENT & BUILD  (granular — one task per page/module)
+  // ═══════════════════════════════════════════════════════════════════════
+  if (hasWebsite) {
+    // ── Backend track ──
+    phase3Tasks.push({
+      title: "Server & Environment Setup",
+      role: "Backend Developer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Technical Architecture Planning",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Database Schema Design",
+      role: "Backend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Server & Environment Setup",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Authentication & User Management API",
+      role: "Backend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Database Schema Design",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Content / CMS API (Pages, Services, Blog)",
+      role: "Backend Developer",
       duration: "3 days",
       priority: "High",
-      dependency: "Market Research & Competitor Analysis",
+      dependency: "Database Schema Design",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Contact Form & Lead Capture API",
+      role: "Backend Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Database Schema Design",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Admin Dashboard API Endpoints",
+      role: "Backend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Content / CMS API (Pages, Services, Blog)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Third-Party Integrations (Email, Payment, Analytics)",
+      role: "Backend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Contact Form & Lead Capture API",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "API Documentation & Backend Testing",
+      role: "Backend Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Admin Dashboard API Endpoints",
+      canRunParallel: true,
+    });
+
+    // ── Frontend track (one task per page, as requested) ──
+    phase3Tasks.push({
+      title: "Shared Navigation, Header & Footer",
+      role: "Frontend Developer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "High-Fidelity UI Mockups (All Screens)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Homepage Development",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Shared Navigation, Header & Footer",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "About Us Page",
+      role: "Frontend Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Shared Navigation, Header & Footer",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Services / Products Page(s)",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Shared Navigation, Header & Footer",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Portfolio / Case Studies Page",
+      role: "Frontend Developer",
+      duration: "1.5 days",
+      priority: "Medium",
+      dependency: "Shared Navigation, Header & Footer",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Blog / News Listing & Detail Pages",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Content / CMS API (Pages, Services, Blog)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Contact Us Page & Form Integration",
+      role: "Frontend Developer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Contact Form & Lead Capture API",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Frontend Routing & State Management",
+      role: "Frontend Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Homepage Development",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Full API Integration (Connect All Pages to Backend)",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Authentication & User Management API",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Responsive Design & Cross-Browser Testing",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Full API Integration (Connect All Pages to Backend)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "SEO Meta Tags & Schema Setup",
+      role: "Frontend Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Full API Integration (Connect All Pages to Backend)",
       canRunParallel: true,
     });
   }
 
-  if (hasDev) {
-    phase2Tasks.push({
-      title: "Database Schema & API Design",
+  if (hasMobile) {
+    phase3Tasks.push({
+      title: "App Architecture & Navigation Setup",
+      role: "Mobile Developer",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Technical Architecture Planning",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Backend API for Mobile App",
       role: "Backend Developer",
       duration: "3 days",
       priority: "High",
       dependency: "Technical Architecture Planning",
       canRunParallel: true,
     });
+    phase3Tasks.push({
+      title: "Onboarding & Authentication Screens",
+      role: "Mobile Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "App Architecture & Navigation Setup",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Home / Dashboard Screen",
+      role: "Mobile Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "App Architecture & Navigation Setup",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Core Feature Screens",
+      role: "Mobile Developer",
+      duration: "3 days",
+      priority: "High",
+      dependency: "Backend API for Mobile App",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Profile & Settings Screens",
+      role: "Mobile Developer",
+      duration: "1.5 days",
+      priority: "Medium",
+      dependency: "Onboarding & Authentication Screens",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Push Notifications Integration",
+      role: "Mobile Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Backend API for Mobile App",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "App Store / Play Store Submission Prep",
+      role: "Mobile Developer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Core Feature Screens",
+      canRunParallel: false,
+    });
   }
 
-  // ── Phase 3: Development & Setup ─────────────────────────────────────────
-  const phase3Tasks = [];
-
-  if (hasDev) {
+  if (hasDashboard) {
     phase3Tasks.push({
-      title: "Project Setup & CI/CD Configuration",
+      title: "Role & Permission System Design",
       role: "Backend Developer",
       duration: "2 days",
       priority: "High",
-      dependency: "Database Schema & API Design",
+      dependency: "Technical Architecture Planning",
       canRunParallel: false,
     });
     phase3Tasks.push({
-      title: "Backend API Development",
+      title: "Role-Based Access Control API",
       role: "Backend Developer",
-      duration: "7 days",
+      duration: "2 days",
       priority: "High",
-      dependency: "Project Setup & CI/CD Configuration",
-      canRunParallel: false,
+      dependency: "Role & Permission System Design",
+      canRunParallel: true,
     });
     phase3Tasks.push({
-      title: "Authentication & Authorization",
-      role: "Backend Developer",
+      title: "Admin Dashboard UI",
+      role: "Frontend Developer",
       duration: "3 days",
       priority: "High",
-      dependency: "Project Setup & CI/CD Configuration",
+      dependency: "Role & Permission System Design",
       canRunParallel: true,
     });
-  }
-
-  if (hasWebsite || hasDesign) {
     phase3Tasks.push({
-      title: "Frontend Development & UI Implementation",
+      title: "Manager Dashboard UI",
       role: "Frontend Developer",
-      duration: "7 days",
+      duration: "2 days",
       priority: "High",
-      dependency: hasDesign ? "UI Design – Screens & Components" : "Project Setup & CI/CD Configuration",
+      dependency: "Role & Permission System Design",
       canRunParallel: true,
     });
-
-    if (hasSEO) {
-      phase3Tasks.push({
-        title: "Landing Page Development (SEO-Optimised)",
-        role: "Frontend Developer",
-        duration: "3 days",
-        priority: "High",
-        dependency: "Frontend Development & UI Implementation",
-        canRunParallel: false,
-      });
-    }
+    phase3Tasks.push({
+      title: "Employee / User Dashboard UI",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Role & Permission System Design",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Dashboard Analytics & Reporting Widgets",
+      role: "Frontend Developer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Role-Based Access Control API",
+      canRunParallel: true,
+    });
   }
 
-  if (hasMarketing || hasSEO) {
+  if (hasAutomation) {
     phase3Tasks.push({
-      title: "Content Creation – Copy & Visual Assets",
-      role: "Content Writer",
-      duration: "5 days",
+      title: "Workflow Design & Trigger Mapping",
+      role: "Automation Engineer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Process Mapping & Requirements Gathering",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Automation Script / Bot Development",
+      role: "Automation Engineer",
+      duration: "4 days",
+      priority: "High",
+      dependency: "Workflow Design & Trigger Mapping",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Third-Party Tool Integrations (APIs / Webhooks)",
+      role: "Automation Engineer",
+      duration: "2 days",
       priority: "Medium",
+      dependency: "Workflow Design & Trigger Mapping",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Error Handling & Retry Logic",
+      role: "Automation Engineer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Automation Script / Bot Development",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasML) {
+    phase3Tasks.push({
+      title: "Data Collection & Preprocessing",
+      role: "ML Engineer",
+      duration: "3 days",
+      priority: "High",
+      dependency: "Data Requirements & Feasibility Study",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Feature Engineering",
+      role: "ML Engineer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Data Collection & Preprocessing",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Model Selection & Training",
+      role: "ML Engineer",
+      duration: "4 days",
+      priority: "High",
+      dependency: "Feature Engineering",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Model Evaluation & Tuning",
+      role: "ML Engineer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "Model Selection & Training",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Model Deployment / API Wrapper",
+      role: "Backend Developer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Model Evaluation & Tuning",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasEmail) {
+    phase3Tasks.push({
+      title: "Email Template Design",
+      role: "Graphic Designer",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Audience Segmentation & List Strategy",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Campaign Copywriting",
+      role: "Content Writer",
+      duration: "2 days",
+      priority: "High",
       dependency: "Content Strategy & Editorial Plan",
       canRunParallel: true,
     });
     phase3Tasks.push({
-      title: "Marketing Campaign Preparation",
-      role: "Marketing Specialist",
-      duration: "4 days",
+      title: "Automation Workflow Setup (Welcome, Drip, Abandoned Cart)",
+      role: "Email Marketing Specialist",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Email Template Design",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "A/B Testing Setup",
+      role: "Email Marketing Specialist",
+      duration: "1 day",
       priority: "Medium",
-      dependency: "Campaign Strategy & KPI Definition",
+      dependency: "Automation Workflow Setup (Welcome, Drip, Abandoned Cart)",
       canRunParallel: true,
     });
   }
 
-  // ── Phase 4: Marketing & Optimization ────────────────────────────────────
-  const phase4Tasks = [];
-
-  if (hasTesting) {
-    phase4Tasks.push({
-      title: "Quality Assurance & Functional Testing",
-      role: "QA Engineer",
-      duration: "4 days",
+  if (hasSEO) {
+    phase3Tasks.push({
+      title: "Technical SEO Audit (Site Speed, Crawlability)",
+      role: "SEO Specialist",
+      duration: "2 days",
       priority: "High",
-      dependency: hasDev ? "Backend API Development" : null,
+      dependency: "Keyword & Competitor Research",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "On-Page SEO Implementation (Meta, Headers, Content)",
+      role: "SEO Specialist",
+      duration: "3 days",
+      priority: "High",
+      dependency: "Technical SEO Audit (Site Speed, Crawlability)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Content Optimization & Internal Linking",
+      role: "SEO Specialist",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: "On-Page SEO Implementation (Meta, Headers, Content)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Backlink Strategy & Outreach",
+      role: "SEO Specialist",
+      duration: "3 days",
+      priority: "Medium",
+      dependency: "On-Page SEO Implementation (Meta, Headers, Content)",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Local SEO & Google Business Profile",
+      role: "SEO Specialist",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Technical SEO Audit (Site Speed, Crawlability)",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasGoogleAds) {
+    phase3Tasks.push({
+      title: "Account Structure & Campaign Strategy",
+      role: "Google Ads Specialist",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Keyword & Competitor Research",
+      canRunParallel: false,
+    });
+    phase3Tasks.push({
+      title: "Ad Copywriting & Extensions Setup",
+      role: "Google Ads Specialist",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Account Structure & Campaign Strategy",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Landing Page Alignment Review",
+      role: "Google Ads Specialist",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: "Account Structure & Campaign Strategy",
+      canRunParallel: true,
+    });
+    phase3Tasks.push({
+      title: "Conversion Tracking & Analytics Setup",
+      role: "Google Ads Specialist",
+      duration: "1 day",
+      priority: "High",
+      dependency: "Account Structure & Campaign Strategy",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasOther && phase3Tasks.length === 0) {
+    // True catch-all fallback — only used when nothing else matched.
+    phase3Tasks.push({
+      title: "Core Feature Development",
+      role: "Full Stack Developer",
+      duration: "5 days",
+      priority: "High",
+      dependency: "Technical Architecture Planning",
+      canRunParallel: false,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PHASE 4: TESTING & QA
+  // ═══════════════════════════════════════════════════════════════════════
+  if (hasBuildProject) {
+    phase4Tasks.push({
+      title: "Functional QA Testing (All Pages & Flows)",
+      role: "QA Engineer",
+      duration: "3 days",
+      priority: "High",
+      dependency: null,
       canRunParallel: true,
     });
     phase4Tasks.push({
       title: "Performance & Load Testing",
       role: "QA Engineer",
-      duration: "3 days",
+      duration: "2 days",
       priority: "Medium",
-      dependency: "Quality Assurance & Functional Testing",
+      dependency: "Functional QA Testing (All Pages & Flows)",
       canRunParallel: false,
     });
-  }
-
-  if (hasSEO) {
     phase4Tasks.push({
-      title: "On-Page SEO Implementation",
-      role: "SEO Specialist",
-      duration: "3 days",
-      priority: "High",
-      dependency: hasTesting ? "Quality Assurance & Functional Testing" : "Content Creation – Copy & Visual Assets",
-      canRunParallel: true,
-    });
-    phase4Tasks.push({
-      title: "Technical SEO Audit & Fixes",
-      role: "SEO Specialist",
+      title: "Cross-Device & Accessibility Testing",
+      role: "QA Engineer",
       duration: "2 days",
       priority: "Medium",
-      dependency: "On-Page SEO Implementation",
-      canRunParallel: true,
-    });
-  }
-
-  if (hasMarketing) {
-    phase4Tasks.push({
-      title: "Social Media Setup & Ad Campaigns",
-      role: "Marketing Specialist",
-      duration: "3 days",
-      priority: "Medium",
-      dependency: "Marketing Campaign Preparation",
+      dependency: "Functional QA Testing (All Pages & Flows)",
       canRunParallel: true,
     });
     phase4Tasks.push({
-      title: "Analytics & Conversion Tracking Setup",
-      role: "Marketing Specialist",
-      duration: "2 days",
-      priority: "Medium",
-      dependency: "Social Media Setup & Ad Campaigns",
-      canRunParallel: true,
-    });
-  }
-
-  if (hasWebsite || hasDev) {
-    phase4Tasks.push({
-      title: "Frontend–Backend Integration",
+      title: "Bug Fixes & Regression Pass",
       role: "Full Stack Developer",
-      duration: "3 days",
-      priority: "High",
-      dependency: "Backend API Development",
-      canRunParallel: true,
-    });
-  }
-
-  // ── Phase 5: Launch & Monitoring ──────────────────────────────────────────
-  const phase5Tasks = [];
-
-  if (hasTesting) {
-    phase5Tasks.push({
-      title: "User Acceptance Testing (UAT)",
-      role: "QA Engineer / Stakeholders",
-      duration: "3 days",
+      duration: "2 days",
       priority: "High",
       dependency: "Performance & Load Testing",
       canRunParallel: false,
     });
   }
 
-  if (hasDev || hasWebsite) {
-    phase5Tasks.push({
-      title: "Production Deployment & DevOps",
-      role: "Backend Developer / DevOps",
-      duration: "2 days",
+  if (hasEmail || hasGoogleAds) {
+    phase4Tasks.push({
+      title: "Campaign QA (Links, Tracking, Rendering)",
+      role: hasEmail ? "Email Marketing Specialist" : "Google Ads Specialist",
+      duration: "1 day",
       priority: "High",
-      dependency: hasTesting ? "User Acceptance Testing (UAT)" : "Frontend–Backend Integration",
-      canRunParallel: false,
-    });
-  }
-
-  if (hasSEO || hasMarketing) {
-    phase5Tasks.push({
-      title: "Go-Live Marketing Push & Announcements",
-      role: "Marketing Specialist",
-      duration: "2 days",
-      priority: "High",
-      dependency: hasDev ? "Production Deployment & DevOps" : null,
+      dependency: null,
       canRunParallel: true,
     });
   }
 
-  phase5Tasks.push({
-    title: "Post-Launch Monitoring & Bug Fixes",
-    role: "Full Team",
-    duration: "5 days",
-    priority: "High",
-    dependency: hasDev ? "Production Deployment & DevOps" : null,
-    canRunParallel: true,
-  });
-
-  if (hasSEO || hasMarketing) {
+  // ═══════════════════════════════════════════════════════════════════════
+  // PHASE 5: LAUNCH & MONITORING
+  // ═══════════════════════════════════════════════════════════════════════
+  if (hasBuildProject) {
     phase5Tasks.push({
-      title: "Performance Reporting & Optimisation",
-      role: "Marketing Specialist / SEO Specialist",
+      title: "User Acceptance Testing (UAT)",
+      role: "QA Engineer / Stakeholders",
+      duration: "2 days",
+      priority: "High",
+      dependency: "Bug Fixes & Regression Pass",
+      canRunParallel: false,
+    });
+    phase5Tasks.push({
+      title: "Production Deployment & DevOps",
+      role: "Backend Developer / DevOps",
+      duration: "1 day",
+      priority: "High",
+      dependency: "User Acceptance Testing (UAT)",
+      canRunParallel: false,
+    });
+    phase5Tasks.push({
+      title: "Post-Launch Monitoring & Bug Fixes",
+      role: "Full Stack Developer",
+      duration: "5 days",
+      priority: "High",
+      dependency: "Production Deployment & DevOps",
+      canRunParallel: true,
+    });
+  }
+
+  if (hasAutomation) {
+    phase5Tasks.push({
+      title: "Monitoring & Alerting Setup",
+      role: "Automation Engineer",
+      duration: "1 day",
+      priority: "Medium",
+      dependency: null,
+      canRunParallel: true,
+    });
+  }
+
+  if (hasML) {
+    phase5Tasks.push({
+      title: "Model Monitoring & Retraining Plan",
+      role: "ML Engineer",
+      duration: "2 days",
+      priority: "Medium",
+      dependency: null,
+      canRunParallel: true,
+    });
+  }
+
+  if (hasMarketingAny) {
+    phase5Tasks.push({
+      title: "Go-Live Marketing Push & Announcements",
+      role: hasSEO ? "SEO Specialist" : hasGoogleAds ? "Google Ads Specialist" : "Email Marketing Specialist",
+      duration: "2 days",
+      priority: "High",
+      dependency: null,
+      canRunParallel: true,
+    });
+    phase5Tasks.push({
+      title: "Performance Reporting & Optimization",
+      role: hasSEO ? "SEO Specialist" : hasGoogleAds ? "Google Ads Specialist" : "Email Marketing Specialist",
       duration: "3 days",
       priority: "Medium",
-      dependency: "Post-Launch Monitoring & Bug Fixes",
+      dependency: "Go-Live Marketing Push & Announcements",
       canRunParallel: true,
     });
   }
 
   return {
     phases: [
-      { name: "Phase 1: Planning & Research",      tasks: phase1Tasks },
-      { name: "Phase 2: Design & Strategy",        tasks: phase2Tasks },
-      { name: "Phase 3: Development & Setup",      tasks: phase3Tasks },
-      { name: "Phase 4: Marketing & Optimization", tasks: phase4Tasks },
-      { name: "Phase 5: Launch & Monitoring",      tasks: phase5Tasks },
+      { name: "Phase 1: Planning & Research",  tasks: phase1Tasks },
+      { name: "Phase 2: Design & Strategy",    tasks: phase2Tasks },
+      { name: "Phase 3: Development & Build",  tasks: phase3Tasks },
+      { name: "Phase 4: Testing & QA",         tasks: phase4Tasks },
+      { name: "Phase 5: Launch & Monitoring",  tasks: phase5Tasks },
     ].filter(p => p.tasks.length > 0),
   };
 }
