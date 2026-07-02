@@ -306,4 +306,105 @@ router.patch('/devices/:id/revoke', protect, authorise('admin'), async (req, res
   res.json({ success: true, data: device });
 });
 
+
+// ─── GET /api/tracker/employee-summary?user_id=&date= ─────────────────────────
+// A rolled-up daily summary for ONE employee: totals, first/last activity,
+// top apps (with category), and time per project. Powers the expandable row.
+router.get('/employee-summary', protect, authorise('admin', 'manager'), async (req, res) => {
+  try {
+    if (!req.query.user_id) {
+      return res.status(400).json({ success: false, message: 'user_id is required' });
+    }
+    const mongoose = require('mongoose');
+    const uid = new mongoose.Types.ObjectId(req.query.user_id);
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const match = { user_id: uid, start: { $gte: dayStart, $lt: dayEnd } };
+
+    const [appRows, projectRows, span, categories] = await Promise.all([
+      // Time per app (non-idle), for top-apps list
+      ActivityLog.aggregate([
+        { $match: { ...match, is_idle: false } },
+        { $group: { _id: '$app_name', seconds: { $sum: '$duration_sec' } } },
+        { $sort: { seconds: -1 } },
+      ]),
+      // Time per task -> project, for time-accounting
+      ActivityLog.aggregate([
+        { $match: { ...match, is_idle: false, task_id: { $ne: null } } },
+        { $group: { _id: '$task_id', seconds: { $sum: '$duration_sec' } } },
+        { $lookup: { from: 'tasks', localField: '_id', foreignField: '_id', as: 'task' } },
+        { $unwind: { path: '$task', preserveNullAndEmptyArrays: true } },
+        { $lookup: { from: 'projects', localField: 'task.project_id', foreignField: '_id', as: 'project' } },
+        { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
+        {
+          $group: {
+            _id: '$project._id',
+            project_name: { $first: '$project.name' },
+            seconds: { $sum: '$seconds' },
+          },
+        },
+        { $sort: { seconds: -1 } },
+      ]),
+      // First and last activity of the day
+      ActivityLog.aggregate([
+        { $match: match },
+        { $group: { _id: null, first: { $min: '$start' }, last: { $max: '$end' } } },
+      ]),
+      AppCategory.find({ is_active: true }).sort({ priority: -1 }).lean(),
+    ]);
+
+    const classify = (appName) => {
+      const name = (appName || '').toLowerCase();
+      const hit = categories.find((c) => name.includes(c.pattern));
+      return hit ? hit.category : 'neutral';
+    };
+
+    let tracked = 0, productive = 0, neutral = 0, unproductive = 0;
+    const topApps = appRows.map((a) => {
+      const category = classify(a._id);
+      tracked += a.seconds;
+      if (category === 'productive') productive += a.seconds;
+      else if (category === 'unproductive') unproductive += a.seconds;
+      else neutral += a.seconds;
+      return { app_name: a._id, seconds: a.seconds, category };
+    });
+
+    // Idle total (separate query kept simple)
+    const idleAgg = await ActivityLog.aggregate([
+      { $match: { ...match, is_idle: true } },
+      { $group: { _id: null, seconds: { $sum: '$duration_sec' } } },
+    ]);
+    const idle = idleAgg.length ? idleAgg[0].seconds : 0;
+
+    const projects = projectRows.map((p) => ({
+      project_name: p.project_name || 'Untagged',
+      seconds: p.seconds,
+    }));
+    const untaggedSec = tracked - projects.reduce((s, p) => s + p.seconds, 0);
+    if (untaggedSec > 0) projects.push({ project_name: 'No task', seconds: untaggedSec });
+
+    res.json({
+      success: true,
+      data: {
+        date: dayStart.toISOString().slice(0, 10),
+        first_activity: span.length ? span[0].first : null,
+        last_activity: span.length ? span[0].last : null,
+        tracked_sec: tracked,
+        idle_sec: idle,
+        productive_sec: productive,
+        neutral_sec: neutral,
+        unproductive_sec: unproductive,
+        productive_pct: tracked ? Math.round((productive / tracked) * 100) : 0,
+        top_apps: topApps.slice(0, 8),
+        projects: projects.sort((a, b) => b.seconds - a.seconds),
+      },
+    });
+  } catch (err) {
+    console.error('Tracker employee-summary error:', err);
+    res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
 module.exports = router;
