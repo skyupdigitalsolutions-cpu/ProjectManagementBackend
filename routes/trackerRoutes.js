@@ -4,9 +4,10 @@
  * Mounted in routes/Index.js as:  router.use('/tracker', trackerRoutes);
  * Full paths therefore: /api/tracker/...
  *
- * Device auth is a SEPARATE long-lived JWT (scope: 'tracker') so revoking a
- * device never touches normal login sessions. Admin/manager dashboard routes
- * use the normal protect + authorise middleware.
+ * DAILY LIMIT: the register + heartbeat responses include `daily_limit_sec`,
+ * read from the active Policy's `full_day_hours`. The agent enforces the limit
+ * locally (wall-clock elapsed since first clock-in today) and signs the user
+ * out when it's reached.
  */
 
 const express = require('express');
@@ -16,12 +17,25 @@ const router = express.Router();
 
 const User = require('../models/users');
 const Task = require('../models/tasks');
+const Policy = require('../models/policy');
 const ActivityLog = require('../models/ActivityLog');
 const AppCategory = require('../models/AppCategory');
 const TrackerDevice = require('../models/TrackerDevice');
 const { protect, authorise } = require('../middleware/authMiddleware');
 
 const TRACKER_JWT_SECRET = process.env.TRACKER_JWT_SECRET || process.env.JWT_SECRET;
+
+// Read the daily tracking limit (seconds) from the active company policy.
+// Falls back to 8h if no policy or field is set.
+async function getDailyLimitSec() {
+  try {
+    const policy = await Policy.findOne({ is_active: true }).select('full_day_hours').lean();
+    const hours = policy && policy.full_day_hours ? policy.full_day_hours : 8;
+    return Math.round(hours * 3600);
+  } catch {
+    return 8 * 3600;
+  }
+}
 
 // ─── Device auth middleware ───────────────────────────────────────────────────
 const trackerAuth = async (req, res, next) => {
@@ -46,7 +60,6 @@ const trackerAuth = async (req, res, next) => {
 };
 
 // ─── POST /api/tracker/device/register ────────────────────────────────────────
-// Body: { email, password, device_name, platform }
 router.post('/device/register', async (req, res) => {
   try {
     const { email, password, device_name, platform } = req.body;
@@ -76,7 +89,15 @@ router.post('/device/register', async (req, res) => {
       { expiresIn: '180d' }
     );
 
-    res.status(201).json({ success: true, token, user_name: user.name, device_id: device._id });
+    const daily_limit_sec = await getDailyLimitSec();
+
+    res.status(201).json({
+      success: true,
+      token,
+      user_name: user.name,
+      device_id: device._id,
+      daily_limit_sec,
+    });
   } catch (err) {
     console.error('Tracker device register error:', err);
     res.status(500).json({ success: false, message: 'Registration failed' });
@@ -84,7 +105,6 @@ router.post('/device/register', async (req, res) => {
 });
 
 // ─── POST /api/tracker/activity/bulk ──────────────────────────────────────────
-// Body: { entries: [...] } — idempotent via unique entry_id
 router.post('/activity/bulk', trackerAuth, async (req, res) => {
   try {
     const entries = (req.body.entries || []).slice(0, 500).map((e) => ({
@@ -107,7 +127,6 @@ router.post('/activity/bulk', trackerAuth, async (req, res) => {
       const result = await ActivityLog.insertMany(entries, { ordered: false });
       inserted = result.length;
     } catch (err) {
-      // E11000 duplicates = agent retried an already-saved batch. Expected.
       if (err.code === 11000 || err.writeErrors) {
         inserted = err.insertedDocs ? err.insertedDocs.length : 0;
       } else {
@@ -122,15 +141,16 @@ router.post('/activity/bulk', trackerAuth, async (req, res) => {
 });
 
 // ─── POST /api/tracker/heartbeat ──────────────────────────────────────────────
+// Returns the current daily limit so the agent always has the latest policy value.
 router.post('/heartbeat', trackerAuth, async (req, res) => {
   req.trackerDevice.last_seen = new Date();
   req.trackerDevice.is_tracking = Boolean(req.body.tracking);
   await req.trackerDevice.save();
-  res.json({ success: true });
+  const daily_limit_sec = await getDailyLimitSec();
+  res.json({ success: true, daily_limit_sec });
 });
 
 // ─── GET /api/tracker/tasks/mine ──────────────────────────────────────────────
-// Open tasks assigned to the agent's user, for the timer dropdown
 router.get('/tasks/mine', trackerAuth, async (req, res) => {
   try {
     const tasks = await Task.find({
@@ -158,7 +178,6 @@ router.get('/tasks/mine', trackerAuth, async (req, res) => {
 });
 
 // ─── GET /api/tracker/summary?date=YYYY-MM-DD ─────────────────────────────────
-// Admin/manager dashboard: KPIs + per-user productivity split
 router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) => {
   try {
     const date = req.query.date ? new Date(req.query.date) : new Date();
@@ -198,7 +217,6 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
       }
     }
 
-    // Attach names/roles in one query
     const userIds = Object.keys(perUser);
     const users = await User.find({ _id: { $in: userIds } }).select('name role designation').lean();
     const nameMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
@@ -243,7 +261,6 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
 });
 
 // ─── GET /api/tracker/activity?user_id=&date= ─────────────────────────────────
-// Timeline drill-down for one employee's day
 router.get('/activity', protect, authorise('admin', 'manager'), async (req, res) => {
   try {
     if (!req.query.user_id) {
@@ -270,7 +287,6 @@ router.get('/activity', protect, authorise('admin', 'manager'), async (req, res)
 });
 
 // ─── GET /api/tracker/devices ─────────────────────────────────────────────────
-// Admin: list paired devices (with kill-switch info)
 router.get('/devices', protect, authorise('admin'), async (req, res) => {
   const devices = await TrackerDevice.find()
     .populate('user_id', 'name email')
