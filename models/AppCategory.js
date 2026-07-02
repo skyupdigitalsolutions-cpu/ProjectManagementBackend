@@ -2,32 +2,37 @@ const mongoose = require('mongoose');
 
 /**
  * Maps apps / window-title keywords to a productivity category.
- * `pattern` is matched as a case-insensitive substring against
- * app_name first, then window_title. First match wins by `priority`.
  *
- * Seed examples:
- *   { pattern: 'code',      category: 'productive',   priority: 10 }
- *   { pattern: 'figma',     category: 'productive',   priority: 10 }
- *   { pattern: 'localhost', category: 'productive',   priority: 20 }
- *   { pattern: 'slack',     category: 'neutral',      priority: 10 }
- *   { pattern: 'youtube',   category: 'unproductive', priority: 20 }
+ * TWO kinds of records:
+ *  - Manual overrides (source: 'manual'): matched as a case-insensitive
+ *    SUBSTRING against "app_name + window_title", highest priority first.
+ *    These always win.
+ *  - AI cache (source: 'ai'): one record per unique classified signature,
+ *    filled automatically by the classification service. Looked up by exact
+ *    `signature`, not substring.
  */
 const appCategorySchema = new mongoose.Schema(
   {
-    pattern: { type: String, required: true, trim: true, lowercase: true },
+    // Manual override matching (substring). Optional for AI records.
+    pattern: { type: String, trim: true, lowercase: true, default: null },
+
+    // AI cache key: normalized "app | title-hint". Unique when present.
+    signature: { type: String, trim: true, default: null, index: true },
+
     category: {
       type: String,
       enum: ['productive', 'neutral', 'unproductive'],
-      required: true
+      required: true,
     },
-    // Optional role scoping, e.g. 'designer' -> Canva productive for designers only
+    source: { type: String, enum: ['manual', 'ai'], default: 'manual' },
     role: { type: String, default: null },
     priority: { type: Number, default: 10 },
-    is_active: { type: Boolean, default: true }
+    is_active: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
 
 appCategorySchema.index({ is_active: 1, priority: -1 });
+appCategorySchema.index({ signature: 1 }, { unique: true, sparse: true });
 
-module.exports = mongoose.model('AppCategory', appCategorySchema);
+module.exports = mongoose.models.AppCategory || mongoose.model('AppCategory', appCategorySchema);

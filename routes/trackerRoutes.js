@@ -20,6 +20,7 @@ const Task = require('../models/tasks');
 const Policy = require('../models/policy');
 const ActivityLog = require('../models/ActivityLog');
 const AppCategory = require('../models/AppCategory');
+const { classifyBatch } = require('../services/classificationService');
 const TrackerDevice = require('../models/TrackerDevice');
 const { protect, authorise } = require('../middleware/authMiddleware');
 
@@ -184,24 +185,22 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
     const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
     const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
 
-    const [rows, categories] = await Promise.all([
-      ActivityLog.aggregate([
-        { $match: { start: { $gte: dayStart, $lt: dayEnd } } },
-        {
-          $group: {
-            _id: { user_id: '$user_id', app_name: '$app_name', is_idle: '$is_idle' },
-            seconds: { $sum: '$duration_sec' },
-          },
+    const rows = await ActivityLog.aggregate([
+      { $match: { start: { $gte: dayStart, $lt: dayEnd } } },
+      {
+        $group: {
+          _id: { user_id: '$user_id', app_name: '$app_name', window_title: '$window_title', is_idle: '$is_idle' },
+          seconds: { $sum: '$duration_sec' },
         },
-      ]),
-      AppCategory.find({ is_active: true }).sort({ priority: -1 }).lean(),
+      },
     ]);
 
-    const classify = (appName) => {
-      const name = (appName || '').toLowerCase();
-      const hit = categories.find((c) => name.includes(c.pattern));
-      return hit ? hit.category : 'neutral';
-    };
+    // Classify all non-idle app/title pairs via manual rules + AI cache
+    const pairs = rows.filter((r) => !r._id.is_idle).map((r) => ({
+      app_name: r._id.app_name, window_title: r._id.window_title,
+    }));
+    const { result: catMap, makeSignature } = await classifyBatch(pairs);
+    const classify = (app, title) => catMap.get(makeSignature(app, title)) || 'neutral';
 
     const perUser = {};
     for (const r of rows) {
@@ -213,7 +212,7 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
         perUser[uid].idle += r.seconds;
       } else {
         perUser[uid].tracked += r.seconds;
-        perUser[uid][classify(r._id.app_name)] += r.seconds;
+        perUser[uid][classify(r._id.app_name, r._id.window_title)] += r.seconds;
       }
     }
 
@@ -323,11 +322,11 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
 
     const match = { user_id: uid, start: { $gte: dayStart, $lt: dayEnd } };
 
-    const [appRows, projectRows, span, categories] = await Promise.all([
-      // Time per app (non-idle), for top-apps list
+    const [appRows, projectRows, span] = await Promise.all([
+      // Time per app+title (non-idle), for top-apps list and classification
       ActivityLog.aggregate([
         { $match: { ...match, is_idle: false } },
-        { $group: { _id: '$app_name', seconds: { $sum: '$duration_sec' } } },
+        { $group: { _id: { app_name: '$app_name', window_title: '$window_title' }, seconds: { $sum: '$duration_sec' } } },
         { $sort: { seconds: -1 } },
       ]),
       // Time per task -> project, for time-accounting
@@ -352,24 +351,35 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
         { $match: match },
         { $group: { _id: null, first: { $min: '$start' }, last: { $max: '$end' } } },
       ]),
-      AppCategory.find({ is_active: true }).sort({ priority: -1 }).lean(),
     ]);
 
-    const classify = (appName) => {
-      const name = (appName || '').toLowerCase();
-      const hit = categories.find((c) => name.includes(c.pattern));
-      return hit ? hit.category : 'neutral';
-    };
+    // Classify each app+title via manual rules + AI cache
+    const { result: catMap, makeSignature } = await classifyBatch(
+      appRows.map((a) => ({ app_name: a._id.app_name, window_title: a._id.window_title }))
+    );
+    const classify = (app, title) => catMap.get(makeSignature(app, title)) || 'neutral';
 
+    // Roll per-app-title rows up to per-app for the Top apps list
+    const appTotals = {};
     let tracked = 0, productive = 0, neutral = 0, unproductive = 0;
-    const topApps = appRows.map((a) => {
-      const category = classify(a._id);
+    for (const a of appRows) {
+      const category = classify(a._id.app_name, a._id.window_title);
       tracked += a.seconds;
       if (category === 'productive') productive += a.seconds;
       else if (category === 'unproductive') unproductive += a.seconds;
       else neutral += a.seconds;
-      return { app_name: a._id, seconds: a.seconds, category };
-    });
+
+      const name = a._id.app_name || 'Unknown';
+      if (!appTotals[name]) appTotals[name] = { app_name: name, seconds: 0, productive: 0, neutral: 0, unproductive: 0 };
+      appTotals[name].seconds += a.seconds;
+      appTotals[name][category] += a.seconds;
+    }
+    // Each app's shown category = its dominant category
+    const topApps = Object.values(appTotals).map((t) => {
+      const cat = t.productive >= t.neutral && t.productive >= t.unproductive ? 'productive'
+        : t.unproductive >= t.neutral ? 'unproductive' : 'neutral';
+      return { app_name: t.app_name, seconds: t.seconds, category: cat };
+    }).sort((a, b) => b.seconds - a.seconds);
 
     // Idle total (separate query kept simple)
     const idleAgg = await ActivityLog.aggregate([
@@ -386,7 +396,7 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
     if (untaggedSec > 0) projects.push({ project_name: 'No task', seconds: untaggedSec });
 
     res.json({
-      success: true,  
+      success: true,
       data: {
         date: dayStart.toISOString().slice(0, 10),
         first_activity: span.length ? span[0].first : null,
