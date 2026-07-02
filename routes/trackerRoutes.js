@@ -386,7 +386,7 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
     if (untaggedSec > 0) projects.push({ project_name: 'No task', seconds: untaggedSec });
 
     res.json({
-      success: true,
+      success: true,  
       data: {
         date: dayStart.toISOString().slice(0, 10),
         first_activity: span.length ? span[0].first : null,
