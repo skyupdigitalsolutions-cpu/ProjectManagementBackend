@@ -361,19 +361,27 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
 
     // Roll per-app-title rows up to per-app for the Top apps list
     const appTotals = {};
+    const unproductiveItems = [];
     let tracked = 0, productive = 0, neutral = 0, unproductive = 0;
     for (const a of appRows) {
       const category = classify(a._id.app_name, a._id.window_title);
       tracked += a.seconds;
       if (category === 'productive') productive += a.seconds;
-      else if (category === 'unproductive') unproductive += a.seconds;
-      else neutral += a.seconds;
+      else if (category === 'unproductive') {
+        unproductive += a.seconds;
+        unproductiveItems.push({
+          app_name: a._id.app_name || 'Unknown',
+          window_title: a._id.window_title || '',
+          seconds: a.seconds,
+        });
+      } else neutral += a.seconds;
 
       const name = a._id.app_name || 'Unknown';
       if (!appTotals[name]) appTotals[name] = { app_name: name, seconds: 0, productive: 0, neutral: 0, unproductive: 0 };
       appTotals[name].seconds += a.seconds;
       appTotals[name][category] += a.seconds;
     }
+    unproductiveItems.sort((a, b) => b.seconds - a.seconds);
     // Each app's shown category = its dominant category
     const topApps = Object.values(appTotals).map((t) => {
       const cat = t.productive >= t.neutral && t.productive >= t.unproductive ? 'productive'
@@ -408,6 +416,7 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
         unproductive_sec: unproductive,
         productive_pct: tracked ? Math.round((productive / tracked) * 100) : 0,
         top_apps: topApps.slice(0, 8),
+        unproductive_items: unproductiveItems.slice(0, 10),
         projects: projects.sort((a, b) => b.seconds - a.seconds),
       },
     });
