@@ -1,5 +1,5 @@
-
 const Task          = require('../models/tasks');
+const Project = require('../models/project');
 const User          = require('../models/users');
 const Leave         = require('../models/leave');
 const Notification  = require('../models/notification');
@@ -584,6 +584,16 @@ async function _buildCandidatePool(projectId, draft, excludeUserId = null) {
   if (!pool.length) {
     const query = { status: 'active', role: 'employee' };
     if (excludeUserId) query._id = { $ne: excludeUserId };
+    // Respect the project's selected team, if one was saved. Prevents the
+    // fallback from leaking tasks to every employee company-wide.
+    try {
+      const proj = await Project.findById(projectId).select('team_members').lean();
+      if (proj && Array.isArray(proj.team_members) && proj.team_members.length > 0) {
+        query._id = query._id
+          ? { ...query._id, $in: proj.team_members }
+          : { $in: proj.team_members };
+      }
+    } catch (_) { /* if lookup fails, fall through to unscoped */ }
     if (neededRole) query.designation = { $regex: neededRole, $options: 'i' };
     else if (neededDept) query.department = { $regex: neededDept, $options: 'i' };
     pool = await User.find(query);

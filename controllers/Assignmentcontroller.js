@@ -799,8 +799,15 @@ const autoAssignForProject = async (req, res) => {
     let totalTasks = 0;
     const createdPhases = [];
 
-    // Pre-load ALL active employees once to avoid N+1 queries
-    const allEmployees = await User.find({ status: 'active', role: 'employee' })
+    // Pre-load employees once to avoid N+1 queries.
+    // IMPORTANT: if the project has a selected team, ONLY those employees are
+    // considered for auto-assignment. Without this, tasks leak to every active
+    // employee company-wide (the reported bug).
+    const employeeQuery = { status: 'active', role: 'employee' };
+    if (Array.isArray(project.team_members) && project.team_members.length > 0) {
+      employeeQuery._id = { $in: project.team_members };
+    }
+    const allEmployees = await User.find(employeeQuery)
       .select('_id name designation department');
 
     // Helper: fuzzy dept match

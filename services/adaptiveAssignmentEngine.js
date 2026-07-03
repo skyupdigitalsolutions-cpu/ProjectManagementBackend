@@ -35,7 +35,7 @@ const { designationMatchesRole } = require("./roleMatching");
 // also contains the word "developer". Now uses the explicit designation
 // families in `./roleMatching` — e.g. "backend developer" only matches
 // Backend/Full-Stack designations, never AI/ML, marketing, etc.
-async function getEligibleEmployees(required_role, required_department, taskStartDate) {
+async function getEligibleEmployees(required_role, required_department, taskStartDate, teamIds = null) {
   const checkDate = taskStartDate ? new Date(taskStartDate) : new Date();
 
   const wordsOf = (str = "") =>
@@ -44,7 +44,12 @@ async function getEligibleEmployees(required_role, required_department, taskStar
 
   // All active employees — filtering happens in JS below since fuzzy
   // family/word matching isn't expressible as a single simple Mongo regex.
-  const candidates = await User.find({ role: "employee", status: "active" }).select(
+  const candidateQuery = { role: "employee", status: "active" };
+  // If a project team was selected, ONLY consider those employees.
+  if (Array.isArray(teamIds) && teamIds.length > 0) {
+    candidateQuery._id = { $in: teamIds };
+  }
+  const candidates = await User.find(candidateQuery).select(
     "_id name designation department status"
   );
 
@@ -171,10 +176,14 @@ async function adaptiveAutoAssign(project, taskDrafts, assignedById) {
 
   for (const draft of taskDrafts) {
     // ── 1. Get eligible employees for this role ───────────────────────────
+    const teamIds = (project && Array.isArray(project.team_members) && project.team_members.length > 0)
+      ? project.team_members
+      : null;
     const eligible = await getEligibleEmployees(
       draft.required_role,
       draft.required_department,
-      draft.start_date
+      draft.start_date,
+      teamIds
     );
 
     // ── 2. Run decision engine ────────────────────────────────────────────

@@ -105,6 +105,10 @@ const ProjectSchema = mongoose.Schema(
 
     plan_version: { type: Number, default: 1 },
 
+    // Employees selected for THIS project. Auto-generation / auto-assignment
+    // only considers these people. Empty array = fall back to all employees.
+    team_members: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
     // Document-driven creation
     document_path:          { type: String, default: null, trim: true },
     document_text:          { type: String, default: null, trim: true },
