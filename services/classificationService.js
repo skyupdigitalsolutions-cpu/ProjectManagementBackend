@@ -44,10 +44,20 @@ async function callOpenAI(appName, windowTitle) {
 
   const prompt =
     `Classify this desktop activity for an employee at a digital marketing and ` +
-    `web development agency as exactly one word: "productive", "neutral", or "unproductive".\n` +
-    `Productive = work tools (coding, design, docs, email, project tools, client sites, research).\n` +
-    `Unproductive = entertainment/social (video streaming, games, social media, shopping for fun).\n` +
-    `Neutral = anything ambiguous or general.\n` +
+    `web development agency as exactly one word: "productive", "neutral", or "unproductive".\n\n` +
+    `PRODUCTIVE = work tools and work content: coding/IDE, design tools, documents, ` +
+    `spreadsheets, email, project management, databases, terminals, developer docs, ` +
+    `Stack Overflow, GitHub, client websites, business/marketing research, work-related AI chats.\n\n` +
+    `UNPRODUCTIVE = entertainment and personal use, regardless of which app or browser shows it. ` +
+    `Judge by the CONTENT in the title, not just the app name. Treat as unproductive:\n` +
+    `- Music or video titles (song names, artist names, "(full song)", "official video", ` +
+    `"lyrics", track durations, a leading "(number)" which is a YouTube notification count)\n` +
+    `- Movies, web series, streaming (Netflix, Prime, Hotstar, YouTube entertainment)\n` +
+    `- Games, social media feeds, memes, sports scores, online shopping for personal items\n\n` +
+    `NEUTRAL = genuinely ambiguous, blank, "new tab", file explorer, system notifications, ` +
+    `or general chat apps used for coordination.\n\n` +
+    `Important: a song or video playing in a web browser is UNPRODUCTIVE even though the ` +
+    `browser is a work tool. Look at what is actually on screen.\n\n` +
     `App: ${appName || 'unknown'}\nWindow title: ${windowTitle || '(none)'}\n` +
     `Answer with only one word.`;
 
@@ -83,6 +93,11 @@ async function callOpenAI(appName, windowTitle) {
  * Classify a batch of {app_name, window_title} pairs.
  * Returns a Map keyed by makeSignature() -> category.
  * Fills the AppCategory AI cache for any new signatures.
+ *
+ * NON-BLOCKING: unknown signatures are returned as 'neutral' immediately and
+ * classified in the BACKGROUND (fired in parallel, not awaited). This means the
+ * dashboard never waits on OpenAI — the first time a new app appears it shows as
+ * neutral, and by the next load it's correctly categorized and cached.
  */
 async function classifyBatch(pairs) {
   const manualRules = await AppCategory.find({ is_active: true, source: 'manual' })
@@ -102,6 +117,7 @@ async function classifyBatch(pairs) {
   const cacheMap = new Map(cached.map((c) => [c.signature, c.category]));
 
   const result = new Map();
+  const toClassify = [];
 
   for (const [sig, p] of bySig) {
     // 1. Manual override wins
@@ -111,19 +127,28 @@ async function classifyBatch(pairs) {
     // 2. AI cache hit
     if (cacheMap.has(sig)) { result.set(sig, cacheMap.get(sig)); continue; }
 
-    // 3. Call AI once, then cache
-    const category = await callOpenAI(p.app_name, p.window_title);
-    result.set(sig, category);
-    try {
-      await AppCategory.updateOne(
-        { signature: sig },
-        { $set: { signature: sig, category, source: 'ai', is_active: true, priority: 1 } },
-        { upsert: true }
-      );
-    } catch (err) {
-      // Duplicate-key race is fine; another request cached it first.
-      if (err.code !== 11000) console.error('cache write error:', err.message);
-    }
+    // 3. Unknown -> return neutral NOW, queue for background classification
+    result.set(sig, 'neutral');
+    toClassify.push({ sig, p });
+  }
+
+  // Fire background classification (parallel, NOT awaited) so the response
+  // returns instantly. Results are cached for the next load.
+  if (toClassify.length) {
+    Promise.allSettled(
+      toClassify.map(async ({ sig, p }) => {
+        const category = await callOpenAI(p.app_name, p.window_title);
+        try {
+          await AppCategory.updateOne(
+            { signature: sig },
+            { $set: { signature: sig, category, source: 'ai', is_active: true, priority: 1 } },
+            { upsert: true }
+          );
+        } catch (err) {
+          if (err.code !== 11000) console.error('cache write error:', err.message);
+        }
+      })
+    ).catch(() => {}); // never let background work crash the process
   }
 
   return { result, makeSignature };
