@@ -26,6 +26,9 @@ function sanitizeTasks(tasks) {
       description:    t.description ? String(t.description).trim() : null,
       designation:    t.designation ? String(t.designation).trim() : null,
       department:     t.department ? String(t.department).trim() : null,
+      assignedTo:     t.assignedTo && String(t.assignedTo).match(/^[0-9a-fA-F]{24}$/)
+        ? t.assignedTo
+        : null,
       estimatedHours: Number(t.estimatedHours) > 0 ? Number(t.estimatedHours) : 8,
       priority:       ["low", "medium", "high", "critical"].includes(t.priority)
         ? t.priority
@@ -149,9 +152,56 @@ const deleteTemplate = async (req, res) => {
   }
 };
 
+// ── GET TEMPLATE FOR A PROJECT TYPE (shaped for the create-project wizard) ─────
+// GET /api/task-templates/for-project?projectType=website_development
+// Returns the active template for that type, with each task's fields renamed
+// to the keys the frontend wizard uses (title, required_role, assignee_id,
+// estimated_hours, subTasks[]). 404 if no active template exists.
+const getTemplateForProject = async (req, res) => {
+  try {
+    const raw = req.query.projectType || "";
+    const slug = String(raw).toLowerCase().trim().replace(/[\s\-]+/g, "_");
+    if (!slug) {
+      return res.status(400).json({ success: false, message: "projectType is required" });
+    }
+
+    const template = await TaskTemplate.findOne({ projectType: slug, isActive: true });
+    if (!template) {
+      return res
+        .status(404)
+        .json({ success: false, message: "No active template for this project type" });
+    }
+
+    const tasks = (template.tasks || []).map((t) => ({
+      title:           t.name,
+      description:     t.description || "",
+      required_role:   t.designation || t.department || "",
+      // Wizard uses `assignee_id`; template stores `assignedTo`.
+      assignee_id:     t.assignedTo ? String(t.assignedTo) : "",
+      priority:        t.priority || "medium",
+      estimated_hours: t.estimatedHours || "",
+      subTasks: (t.subtasks || []).map((s) => ({ title: s.name })),
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        _id:         template._id,
+        name:        template.name,
+        projectType: template.projectType,
+        tasks,
+      },
+    });
+  } catch (err) {
+    console.error("[taskTemplate] for-project error:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to load template" });
+  }
+};
+
 module.exports = {
   listTemplates,
   getTemplate,
+  getTemplateForProject,
   createTemplate,
   updateTemplate,
   deleteTemplate,

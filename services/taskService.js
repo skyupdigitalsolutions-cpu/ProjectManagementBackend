@@ -259,9 +259,24 @@ async function createTasksFromDbTemplate(project, type, createdByUserId) {
     const dueDate = new Date(cursor);
     dueDate.setDate(dueDate.getDate() + estDays);
 
-    // Role for auto-assignment: prefer designation, fall back to department.
+    // Assignment: prefer the pinned employee, else match by role.
     const requiredRole = t.designation || t.department || null;
-    const assignedUser = await findUserByRole(requiredRole);
+    let assignedUser = null;
+    let assignReason = '';
+    if (t.assignedTo) {
+      assignedUser = { _id: t.assignedTo };
+      assignReason = 'Pre-assigned in template';
+    } else {
+      const matched = await findUserByRole(requiredRole);
+      if (matched) {
+        assignedUser = matched;
+        assignReason = `Matched by role: ${requiredRole}`;
+      } else {
+        assignReason = requiredRole
+          ? 'No matching employee found — manual assignment needed'
+          : 'No role specified in template — manual assignment needed';
+      }
+    }
 
     taskDocs.push({
       project_id:  project._id,
@@ -274,11 +289,7 @@ async function createTasksFromDbTemplate(project, type, createdByUserId) {
       priority:    ['low', 'medium', 'high', 'critical'].includes(t.priority) ? t.priority : 'medium',
       status:      assignedUser ? 'todo' : 'unassigned',
       is_auto_assigned:   true,
-      auto_assign_reason: assignedUser
-        ? `Matched by role: ${requiredRole}`
-        : (requiredRole
-            ? 'No matching employee found — manual assignment needed'
-            : 'No role specified in template — manual assignment needed'),
+      auto_assign_reason: assignReason,
       start_date:      new Date(cursor),
       end_date:        new Date(dueDate),
       due_date:        new Date(dueDate),

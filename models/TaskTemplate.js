@@ -36,6 +36,14 @@ const TemplateTaskSchema = new mongoose.Schema(
     designation: { type: String, default: null, trim: true },
     department:  { type: String, default: null, trim: true },
 
+    // OPTIONAL: pin this task to a SPECIFIC employee. When set, it takes
+    // priority over designation/department role-matching at generation time.
+    assignedTo: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
     estimatedHours: { type: Number, default: 8, min: 1 },
 
     priority: {
@@ -78,14 +86,13 @@ const TaskTemplateSchema = new mongoose.Schema(
 );
 
 // Always store projectType as a clean slug regardless of what the client sends.
-TaskTemplateSchema.pre("validate", function (next) {
+TaskTemplateSchema.pre("validate", function () {
   if (this.projectType) {
     this.projectType = this.projectType
       .toLowerCase()
       .trim()
       .replace(/[\s\-]+/g, "_");
   }
-  next();
 });
 
 const TaskTemplate = mongoose.model("TaskTemplate", TaskTemplateSchema);

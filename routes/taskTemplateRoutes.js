@@ -12,6 +12,7 @@ const { protect, authorise } = require("../middleware/authMiddleware");
 const {
   listTemplates,
   getTemplate,
+  getTemplateForProject,
   createTemplate,
   updateTemplate,
   deleteTemplate,
@@ -20,6 +21,8 @@ const {
 router.use(protect, authorise("admin", "manager"));
 
 router.get("/", listTemplates);
+// Must come BEFORE "/:id" so "for-project" isn't captured as an id.
+router.get("/for-project", getTemplateForProject);
 router.get("/:id", getTemplate);
 router.post("/", createTemplate);
 router.put("/:id", updateTemplate);
