@@ -57,6 +57,9 @@ const excelTemplateRoutes = require("./Exceltemplateroutes");
 // tracker route
 const trackerRoutes = require("./trackerRoutes");
 
+// ── Task Templates (per-service manual templates) ─────────────────────────────
+const taskTemplateRoutes = require("./taskTemplateRoutes");
+
 // ── Mount routes ──────────────────────────────────────────────────────────────
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
@@ -78,5 +81,6 @@ router.use("/leaves", leaveRoutes);
 router.use("/upload", uploadRoutes);
 router.use("/excel-template", excelTemplateRoutes);
 router.use("/tracker", trackerRoutes);
+router.use("/task-templates", taskTemplateRoutes);
 
 module.exports = router;
