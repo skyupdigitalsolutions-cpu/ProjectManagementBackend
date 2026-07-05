@@ -55,6 +55,7 @@ const ROLE_FAMILY_RULES = [
   { test: /qa|quality|test/,                 families: ["qa"] },
   { test: /seo/,                             families: ["seo"] },
   { test: /google\s*ads/,                    families: ["marketing"] },
+  { test: /meta\s*ads|facebook\s*ads|paid\s*social/, families: ['marketing'] },
   { test: /email\s*marketing/,               families: ["marketing"] },
   { test: /marketing/,                       families: ["marketing"] },
   { test: /content/,                         families: ["content"] },
