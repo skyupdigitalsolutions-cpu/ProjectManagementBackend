@@ -99,9 +99,9 @@ const deleteMessage = async (req, res) => {
     if (msg.sender_id.toString() !== req.user._id.toString())
       return res.status(403).json({ success: false, message: 'You can only delete your own messages' });
 
-    msg.deleted = true;
-    msg.content = '';
-    await msg.save();
+    // Soft delete. Use updateOne (not .save) so the `content: required` rule
+    // doesn't reject the cleared content. getMessages filters out deleted docs.
+    await Message.updateOne({ _id: id }, { $set: { deleted: true, content: '' } });
 
     return res.status(200).json({ success: true, message: 'Message deleted' });
   } catch (error) {
