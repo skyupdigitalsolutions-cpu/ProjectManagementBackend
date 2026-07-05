@@ -15,7 +15,7 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 const Task = require('../models/tasks');
-const { resolvePhase, PHASE_NAMES } = require('../services/phaseGate');
+const { resolvePhase, PHASE_NAMES, stampUnlocks } = require('../services/phaseGate');
 
 const MONGO_URI =
   process.env.MONGODB_SEED_URI ||
@@ -46,6 +46,13 @@ async function run() {
   }
 
   console.log(`\nDone. Updated ${updated} task(s).`);
+
+  // Stamp unlock times so the delay clock has a start point for unlocked tasks.
+  const projectIds = await Task.find(filter).distinct('project_id');
+  let stamped = 0;
+  for (const pid of projectIds) stamped += await stampUnlocks(pid);
+  console.log(`Stamped unlock time on ${stamped} task(s) across ${projectIds.length} project(s).`);
+
   await mongoose.disconnect();
 }
 
