@@ -1,4 +1,5 @@
 const Dailyreport = require("../models/Dailyreport");
+const { notifyAdmins } = require("../services/notify");
 
 // Helper: normalise a date to midnight local time
 const toMidnight = (d) => {
@@ -19,6 +20,9 @@ const submitReport = async (req, res) => {
 
     const today = toMidnight(new Date());
 
+    // Was today's report already submitted? (avoid notifying admins on every edit)
+    const alreadySubmitted = await Dailyreport.exists({ user_id: req.user._id, date: today });
+
     const report = await Dailyreport.findOneAndUpdate(
       { user_id: req.user._id, date: today },
       {
@@ -34,6 +38,16 @@ const submitReport = async (req, res) => {
       },
       { upsert: true, new: true, runValidators: true }
     );
+
+    if (!alreadySubmitted) {
+      await notifyAdmins({
+        message:   `${req.user.name || "An employee"} submitted their daily report for ${today.toDateString()}.`,
+        type:      "daily_report_submitted",
+        ref_id:    report._id,
+        ref_type:  null,
+        sender_id: req.user._id,
+      });
+    }
 
     return res.status(200).json({
       success: true,

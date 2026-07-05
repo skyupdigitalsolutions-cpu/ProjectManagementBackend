@@ -23,6 +23,7 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const TaskTemplate = require('../models/TaskTemplate');
 const User = require('../models/users');
+const { resolvePhase, PHASE_NAMES } = require('../services/phaseGate');
 
 const MONGO_URI =
   process.env.MONGODB_SEED_URI ||
@@ -118,6 +119,7 @@ async function run() {
     const emp = await resolveAssignee(t);
     if (emp) console.log(`  ✓ ${t.name}\n       → ${emp.name} (${emp.designation})`);
     else     console.log(`  · ${t.name}  → no employee matched (role-only)`);
+    const phase = resolvePhase(t.name);
     tasks.push({
       name: t.name,
       description: null,
@@ -126,6 +128,8 @@ async function run() {
       assignedTo: emp ? emp._id : null,
       estimatedHours: t.estimatedHours,
       priority: t.priority,
+      phase,
+      phaseName: phase ? PHASE_NAMES[phase] : null,
       subtasks: [],
     });
   }

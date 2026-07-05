@@ -52,6 +52,11 @@ const TemplateTaskSchema = new mongoose.Schema(
       default: "medium",
     },
 
+    // OPTIONAL: phase gating (1 = Design · 2 = Development · 3 = Testing & Deploy).
+    // When set, generated Task docs inherit it and are gated accordingly.
+    phase:     { type: Number, default: null },
+    phaseName: { type: String, default: null, trim: true },
+
     subtasks: { type: [TemplateSubtaskSchema], default: [] },
   },
   { _id: true }

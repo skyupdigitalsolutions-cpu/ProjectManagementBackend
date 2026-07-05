@@ -18,6 +18,8 @@ const {
   rebalanceTasks,
   getUserWorkloadScore,
 } = require('../services/autoAssignService');
+const { getLockState, annotateLockState } = require('../services/phaseGate');
+const { notifyAdmins } = require('../services/notify');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 const handleError = (res, error, statusCode = 500) => {
@@ -181,11 +183,13 @@ const getAllTasks = async (req, res) => {
       Task.countDocuments(filter),
     ]);
 
+    const data = await annotateLockState(tasks);
+
     return res.status(200).json({
       success: true, total,
       page:    Number(page),
       pages:   Math.ceil(total / Number(limit)),
-      data:    tasks,
+      data,
     });
   } catch (error) {
     return handleError(res, error);
@@ -240,11 +244,21 @@ const updateTask = async (req, res) => {
     if (!isAdmin && !isManager && !isOwner)
       return res.status(403).json({ success: false, message: 'Not authorised' });
 
+    // ── Phase gate: non-admins cannot update a task whose earlier phases aren't done ──
+    if (!isAdmin) {
+      const lock = await getLockState(task);
+      if (lock.locked) {
+        return res.status(423).json({ success: false, message: lock.reason, is_locked: true });
+      }
+    }
+
     const updates = { ...req.body };
     delete updates._id;
     delete updates.createdAt;
     delete updates.updatedAt;
     delete updates.subtasks; // subtasks managed via dedicated endpoints
+    delete updates.phase;      // phase is workflow metadata, not user-editable here
+    delete updates.phase_name;
 
     if (updates.priority) {
       updates.priority_score = PRIORITY_SCORE[updates.priority] || 50;
@@ -261,6 +275,18 @@ const updateTask = async (req, res) => {
     )
       .populate('assigned_to', 'name email')
       .populate('assigned_by', 'name email');
+
+    // Notify admins whenever a non-admin edits a task from their dashboard
+    if (!isAdmin) {
+      const statusNote = updates.status ? ` — status set to "${updates.status}"` : '';
+      await notifyAdmins({
+        message:   `${req.user.name || 'An employee'} updated task "${task.title}"${statusNote}.`,
+        type:      'task_updated',
+        ref_id:    task._id,
+        ref_type:  'Task',
+        sender_id: req.user._id,
+      });
+    }
 
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {
@@ -303,6 +329,14 @@ const updateTaskStatus = async (req, res) => {
     if (!isAdmin && !isManager && !isOwner)
       return res.status(403).json({ success: false, message: 'Not authorised to update this task' });
 
+    // ── Phase gate for non-admins ──
+    if (!isAdmin) {
+      const lock = await getLockState(task);
+      if (lock.locked) {
+        return res.status(423).json({ success: false, message: lock.reason, is_locked: true });
+      }
+    }
+
     const statusUpdates = { status };
     if (status === 'completed') {
       statusUpdates.completed_at    = new Date();
@@ -314,6 +348,16 @@ const updateTaskStatus = async (req, res) => {
     const updated = await Task.findByIdAndUpdate(
       id, { $set: statusUpdates }, { new: true }
     ).populate('assigned_to', 'name email');
+
+    if (!isAdmin) {
+      await notifyAdmins({
+        message:   `${req.user.name || 'An employee'} changed task "${task.title}" status to "${status}".`,
+        type:      status === 'completed' ? 'task_completed' : 'task_updated',
+        ref_id:    task._id,
+        ref_type:  'Task',
+        sender_id: req.user._id,
+      });
+    }
 
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {
@@ -427,6 +471,17 @@ const updateProgress = async (req, res) => {
     if (isNaN(percent) || percent < 0 || percent > 100)
       return res.status(400).json({ success: false, message: 'progress_percent must be 0–100' });
 
+    const task = await Task.findById(id);
+    if (!task) return res.status(404).json({ success: false, message: 'Task not found' });
+
+    const isAdmin = req.user.role === 'admin';
+    if (!isAdmin) {
+      const lock = await getLockState(task);
+      if (lock.locked) {
+        return res.status(423).json({ success: false, message: lock.reason, is_locked: true });
+      }
+    }
+
     const updated = await Task.findByIdAndUpdate(
       id,
       {
@@ -440,6 +495,16 @@ const updateProgress = async (req, res) => {
     );
 
     if (!updated) return res.status(404).json({ success: false, message: 'Task not found' });
+
+    if (!isAdmin) {
+      await notifyAdmins({
+        message:   `${req.user.name || 'An employee'} set task "${task.title}" progress to ${percent}%.`,
+        type:      percent === 100 ? 'task_completed' : 'task_updated',
+        ref_id:    task._id,
+        ref_type:  'Task',
+        sender_id: req.user._id,
+      });
+    }
 
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {

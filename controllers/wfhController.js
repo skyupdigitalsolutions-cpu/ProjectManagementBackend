@@ -11,6 +11,7 @@
 
 const WfhRequest = require('../models/WfhRequest');
 const User       = require('../models/users');
+const { notifyAdmins } = require('../services/notify');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  submitWfhRequest
@@ -47,6 +48,14 @@ const submitWfhRequest = async (req, res) => {
       from_date: from,
       to_date:   to,
       reason:    reason.trim(),
+    });
+
+    await notifyAdmins({
+      message:   `${req.user.name || 'An employee'} submitted a Work-From-Home request (${from.toDateString()} → ${to.toDateString()}).`,
+      type:      'wfh_requested',
+      ref_id:    request._id,
+      ref_type:  null,
+      sender_id: req.user._id,
     });
 
     return res.status(201).json({

@@ -38,6 +38,10 @@ const NotificationSchema = mongoose.Schema(
         "task_reminder",   // daily 9AM briefing sent by cronScheduler.js
         "system_alert",    // admin alerts (overdue count, no-employee warnings)
         "approval_requested", // employee asks approval on a project or general item
+        // ── NEW: employee-side activity notifications to admins ─────────────
+        "leave_requested",        // employee applied for leave
+        "wfh_requested",          // employee submitted a WFH request
+        "daily_report_submitted", // employee submitted their daily report
       ],
       required: true,
     },

@@ -113,6 +113,13 @@ const TasksSchema = mongoose.Schema(
     module_name:    { type: String, default: null, trim: true },
     estimated_days: { type: Number, default: 1 },
 
+    // ── Phase gating (Website Development workflow) ─────────────────────────────
+    // 1 = Design & Planning · 2 = Development · 3 = Testing & Deployment
+    // A task is locked from updates until all earlier-phase tasks in the same
+    // project are completed. Null = not part of a phased workflow (never locked).
+    phase:      { type: Number, default: null },
+    phase_name: { type: String, default: null, trim: true },
+
     // ── Day-wise scheduling ────────────────────────────────────────────────────
     start_date: { type: Date, default: null },
     end_date:   { type: Date, default: null },

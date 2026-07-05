@@ -18,6 +18,7 @@ const User      = require('../models/users');
 const Notification = require('../models/notification');
 const eventBus  = require('../services/eventBus');
 const { uploadBufferToCloudinary } = require('../config/cloudinary');
+const { notifyAdmins } = require('../services/notify');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 const handleError = (res, error, statusCode = 500) => {
@@ -102,6 +103,14 @@ const applyLeave = async (req, res) => {
       contact_during_leave: contact_during_leave || null,
       handover_notes:       handover_notes       || null,
       documents,
+    });
+
+    await notifyAdmins({
+      message:   `${req.user.name || 'An employee'} applied for ${leave_type} leave (${from.toDateString()} → ${to.toDateString()}, ${days} day${Number(days) === 1 ? '' : 's'}).`,
+      type:      'leave_requested',
+      ref_id:    leave._id,
+      ref_type:  null,
+      sender_id: req.user._id,
     });
 
     return res.status(201).json({ success: true, data: leave });
