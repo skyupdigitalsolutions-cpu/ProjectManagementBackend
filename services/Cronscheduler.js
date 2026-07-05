@@ -22,6 +22,8 @@ const Task         = require('../models/tasks');
 const User         = require('../models/users');
 const Notification = require('../models/notification');
 const { rebalanceTasks } = require('./autoAssignService');
+const { annotateLockState, stampUnlocks, durationDays } = require('./phaseGate');
+const { notifyAdmins } = require('./notify');
 const log = require('./assignmentLogger');
 
 // ─── Brevo client factory (mirrors emailController.js pattern) ────────────────
@@ -56,16 +58,57 @@ function formatDate(date) {
 // ─── JOB 1: Mark overdue ─────────────────────────────────────────────────────
 
 async function markOverdueTasks() {
-  const result = await Task.updateMany(
+  const now = new Date();
+
+  // 1) Non-phased tasks keep the classic static due_date behaviour.
+  const legacy = await Task.updateMany(
     {
-      due_date:   { $lt: new Date() },
+      phase:      null,
+      due_date:   { $lt: now },
       status:     { $in: ['todo', 'in-progress', 'on-hold'] },
       is_delayed: { $ne: true },
     },
     { $set: { is_delayed: true, delay_reason: 'Auto-marked: past due date' } }
   );
-  console.log(`[CRON] Marked ${result.modifiedCount} tasks as overdue`);
-  return result.modifiedCount;
+
+  // 2) Phased tasks: the delay clock starts at unlock. Locked tasks are never
+  //    delayed; an unlocked task is delayed once (unlocked_at + duration) passes.
+  const projectIds = await Task.find({ phase: { $ne: null } }).distinct('project_id');
+  let phasedDelayed = 0;
+
+  for (const pid of projectIds) {
+    await stampUnlocks(pid).catch(() => {});
+
+    const candidates = await Task.find({
+      project_id: pid,
+      phase:      { $ne: null },
+      status:     { $in: ['todo', 'in-progress', 'on-hold'] },
+      is_delayed: { $ne: true },
+    });
+
+    const annotated = await annotateLockState(candidates);
+    for (const t of annotated) {
+      if (t.is_locked) continue;                        // locked → not counted
+      const due = t.effective_due_date;                 // unlocked_at + duration
+      if (!due || now <= new Date(due)) continue;       // still within duration
+
+      await Task.updateOne(
+        { _id: t._id },
+        { $set: { is_delayed: true, delay_reason: 'Not completed within allotted duration after unlock' } }
+      );
+      await notifyAdmins({
+        message:  `⏰ Task "${t.title}" is delayed — not completed within its ${durationDays(t)} day(s) after unlocking.`,
+        type:     'task_delayed',
+        ref_id:   t._id,
+        ref_type: 'Task',
+      });
+      phasedDelayed += 1;
+    }
+  }
+
+  const total = (legacy.modifiedCount || 0) + phasedDelayed;
+  console.log(`[CRON] Marked ${total} task(s) delayed (${phasedDelayed} phased, ${legacy.modifiedCount || 0} legacy)`);
+  return total;
 }
 
 // ─── JOB 2: Daily task notifications ─────────────────────────────────────────

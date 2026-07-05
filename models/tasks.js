@@ -120,6 +120,10 @@ const TasksSchema = mongoose.Schema(
     phase:      { type: Number, default: null },
     phase_name: { type: String, default: null, trim: true },
 
+    // When this task became workable (all earlier phases complete). The delay
+    // clock starts here — a locked task is never counted as delayed.
+    unlocked_at: { type: Date, default: null },
+
     // ── Day-wise scheduling ────────────────────────────────────────────────────
     start_date: { type: Date, default: null },
     end_date:   { type: Date, default: null },

@@ -18,7 +18,7 @@ const {
   rebalanceTasks,
   getUserWorkloadScore,
 } = require('../services/autoAssignService');
-const { getLockState, annotateLockState } = require('../services/phaseGate');
+const { getLockState, annotateLockState, stampUnlocks } = require('../services/phaseGate');
 const { notifyAdmins } = require('../services/notify');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -288,6 +288,8 @@ const updateTask = async (req, res) => {
       });
     }
 
+    stampUnlocks(task.project_id).catch(() => {});
+
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {
     if (error.name === 'ValidationError')
@@ -329,7 +331,7 @@ const updateTaskStatus = async (req, res) => {
     if (!isAdmin && !isManager && !isOwner)
       return res.status(403).json({ success: false, message: 'Not authorised to update this task' });
 
-    // ── Phase gate for non-admins ──
+    // ── Phase gate (admins bypass) ──
     if (!isAdmin) {
       const lock = await getLockState(task);
       if (lock.locked) {
@@ -358,6 +360,8 @@ const updateTaskStatus = async (req, res) => {
         sender_id: req.user._id,
       });
     }
+
+    stampUnlocks(task.project_id).catch(() => {});
 
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {
@@ -399,10 +403,29 @@ const bulkUpdateStatus = async (req, res) => {
       ? { completed_at: new Date(), progress_percent: 100 }
       : { completed_at: null };
 
+    // ── Phase gate: non-admins can't bulk-update locked tasks ──
+    if (req.user.role !== 'admin') {
+      const targets = await Task.find({ _id: { $in: task_ids } })
+        .select('project_id title phase status');
+      const annotated = await annotateLockState(targets);
+      const lockedCount = annotated.filter((t) => t.is_locked).length;
+      if (lockedCount > 0) {
+        return res.status(423).json({
+          success: false,
+          message: `${lockedCount} of the selected task(s) are locked by workflow phase. Complete the earlier phases first.`,
+          is_locked: true,
+        });
+      }
+    }
+
     const result = await Task.updateMany(
       { _id: { $in: task_ids } },
       { $set: { status, ...extraUpdates } }
     );
+
+    // Re-stamp unlock times for every affected project (completions may unlock later phases)
+    const projs = await Task.find({ _id: { $in: task_ids } }).distinct('project_id');
+    await Promise.all(projs.map((p) => stampUnlocks(p).catch(() => {})));
 
     return res.status(200).json({
       success: true,
@@ -505,6 +528,8 @@ const updateProgress = async (req, res) => {
         sender_id: req.user._id,
       });
     }
+
+    stampUnlocks(task.project_id).catch(() => {});
 
     return res.status(200).json({ success: true, data: updated });
   } catch (error) {
