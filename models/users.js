@@ -120,6 +120,14 @@ const UserSchema = mongoose.Schema(
       trim: true,
     },
 
+    // ── Mailbox (Hostinger webmail) ───────────────────────────────────────────
+    // Stores the user's Hostinger mailbox login. password_enc is AES-256-GCM
+    // encrypted and select:false so it is never returned by default queries.
+    mail_config: {
+      email:        { type: String, default: null, trim: true },
+      password_enc: { type: String, default: null, select: false },
+    },
+
     // ── Work mode / attendance ────────────────────────────────────────────────
     // work_mode is informational; attendance_override is an admin "always allow
     // manual clock" escape hatch (normally manual clock is gated by approved WFH).

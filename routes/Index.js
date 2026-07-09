@@ -10,6 +10,7 @@
  *  - excelTemplateRoutes → /excel-template  (Global Excel Template)
  *  - wfhRoutes           → /wfh    (Work From Home requests)
  *  - policyRoutes        → /policy (Attendance policy, holidays, WFH policy)
+ *  - mailRoutes          → /mail   (Hostinger webmail)
  */
 
 const express = require("express");
@@ -63,6 +64,9 @@ const taskTemplateRoutes = require("./taskTemplateRoutes");
 // ── Employee-only chat ────────────────────────────────────────────────────────
 const employeeChatRoutes = require("./employeeChatRoutes");
 
+// ── Hostinger webmail ─────────────────────────────────────────────────────────
+const mailRoutes = require("./mailroutes");
+
 // ── Mount routes ──────────────────────────────────────────────────────────────
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
@@ -86,5 +90,6 @@ router.use("/excel-template", excelTemplateRoutes);
 router.use("/tracker", trackerRoutes);
 router.use("/task-templates", taskTemplateRoutes);
 router.use("/employee-chat", employeeChatRoutes);
+router.use("/mail", mailRoutes);
 
 module.exports = router;
