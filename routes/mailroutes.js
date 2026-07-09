@@ -1,15 +1,13 @@
 // routes/mailroutes.js  (CommonJS)
-//
-// Paths below match your structure:
-//   models/users.js, middleware/authMiddleware.js, utils/crypto.js, services/mailservice.js
-// This file goes in  routes/  and is registered in routes/Index.js (see instructions).
+// Registered in routes/Index.js as router.use("/mail", mailRoutes) -> /api/mail/*
 
 const express = require('express');
 const User = require('../models/users');
 const { protect } = require('../middleware/authMiddleware');
 const { encrypt, decrypt } = require('../utils/crypto');
 const {
-  verifyMailbox, listMessages, getMessage, sendMessage,
+  verifyMailbox, listFolders, listMessages, getMessage,
+  deleteMessage, getContacts, sendMessage,
 } = require('../services/mailservice');
 
 const router = express.Router();
@@ -26,7 +24,8 @@ router.post('/connect', protect, async (req, res) => {
   if (!email || !password) return res.status(400).json({ message: 'Email and password are required' });
   try {
     await verifyMailbox({ email, password });
-  } catch {
+  } catch (e) {
+    console.error('[mail] connect failed:', e.code, e.message);
     return res.status(401).json({ message: 'Could not sign in to that mailbox. Check the email and password.' });
   }
   await User.findByIdAndUpdate(req.user._id, {
@@ -35,7 +34,7 @@ router.post('/connect', protect, async (req, res) => {
   res.json({ connected: true, email });
 });
 
-// Is a mailbox connected? (never returns the password)
+// Status
 router.get('/status', protect, async (req, res) => {
   const creds = await credsFor(req.user._id);
   res.json({ connected: !!creds, email: creds ? creds.email : null });
@@ -47,19 +46,50 @@ router.delete('/disconnect', protect, async (req, res) => {
   res.json({ connected: false });
 });
 
-// List messages
+// Folders
+router.get('/folders', protect, async (req, res) => {
+  const creds = await credsFor(req.user._id);
+  if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
+  try {
+    const data = await listFolders(creds);
+    res.json({ data });
+  } catch (e) {
+    console.error('[mail] folders failed:', e.code, e.message);
+    res.status(502).json({ message: 'Failed to load folders', error: e.message });
+  }
+});
+
+// Contacts (derived from mail participants)
+router.get('/contacts', protect, async (req, res) => {
+  const creds = await credsFor(req.user._id);
+  if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
+  try {
+    const data = await getContacts(creds);
+    res.json({ data });
+  } catch (e) {
+    console.error('[mail] contacts failed:', e.code, e.message);
+    res.status(502).json({ message: 'Failed to load contacts', error: e.message });
+  }
+});
+
+// List / search messages   ?box=INBOX&limit=40&search=term
 router.get('/messages', protect, async (req, res) => {
   const creds = await credsFor(req.user._id);
   if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
   try {
-    const data = await listMessages(creds, req.query.box || 'INBOX', Number(req.query.limit) || 40);
+    const data = await listMessages(creds, {
+      box: req.query.box || 'INBOX',
+      limit: Number(req.query.limit) || 40,
+      search: req.query.search || '',
+    });
     res.json({ data });
   } catch (e) {
+    console.error('[mail] list failed:', e.code, e.message);
     res.status(502).json({ message: 'Failed to fetch mail', error: e.message });
   }
 });
 
-// Read one message (marks as seen)
+// Read one message
 router.get('/messages/:uid', protect, async (req, res) => {
   const creds = await credsFor(req.user._id);
   if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
@@ -67,7 +97,21 @@ router.get('/messages/:uid', protect, async (req, res) => {
     const data = await getMessage(creds, Number(req.params.uid), req.query.box || 'INBOX');
     res.json({ data });
   } catch (e) {
+    console.error('[mail] read failed:', e.code, e.message);
     res.status(502).json({ message: 'Failed to open message', error: e.message });
+  }
+});
+
+// Delete (move to Trash if available)
+router.delete('/messages/:uid', protect, async (req, res) => {
+  const creds = await credsFor(req.user._id);
+  if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
+  try {
+    await deleteMessage(creds, Number(req.params.uid), req.query.box || 'INBOX');
+    res.json({ deleted: true });
+  } catch (e) {
+    console.error('[mail] delete failed:', e.code, e.message);
+    res.status(502).json({ message: 'Failed to delete message', error: e.message });
   }
 });
 
@@ -79,7 +123,9 @@ router.post('/send', protect, async (req, res) => {
     const data = await sendMessage(creds, req.body || {});
     res.json({ data });
   } catch (e) {
-    res.status(502).json({ message: 'Failed to send message', error: e.message });
+    // Full detail in Render logs so SMTP failures are diagnosable
+    console.error('[mail] send failed:', e.code, e.message);
+    res.status(502).json({ message: 'Failed to send message', code: e.code || null, error: e.message });
   }
 });
 
