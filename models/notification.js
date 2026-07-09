@@ -54,6 +54,9 @@ const NotificationSchema = mongoose.Schema(
     },
     is_sent:         { type: Boolean, default: false },
     recipient_count: { type: Number, default: null },
+    // Recipients this (outbox) notification was sent to — used to show
+    // "To: …" in the admin/manager Sent tab.
+    recipient_ids:   [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   },
   { timestamps: true }
 );

@@ -24,7 +24,11 @@ const getMyNotifications = async (req, res) => {
     const skip = (Number(page) - 1) * Number(limit);
 
     const [notifications, total, unread_count] = await Promise.all([
-      Notification.find(filter).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+      Notification.find(filter)
+        .populate("sender_id", "name email role")   // so inbox can show "From: …"
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit)),
       Notification.countDocuments(filter),
       Notification.countDocuments({ user_id: req.user._id, is_read: false, is_sent: { $ne: true } }),
     ]);
@@ -60,7 +64,7 @@ const getSentNotifications = async (req, res) => {
 
     const [notifications, total] = await Promise.all([
       Notification.find(filter)
-        .populate("user_id", "name email role")  // outbox copy user_id = sender themselves
+        .populate("recipient_ids", "name email role")  // so Sent tab can show "To: …"
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(Number(limit)),
@@ -237,6 +241,7 @@ const sendNotification = async (req, res) => {
       ref_type:        ref_type || null,
       is_sent:         true,
       recipient_count: user_ids.length,
+      recipient_ids:   user_ids,
       is_read:         true,   // outbox items don't need to show as "unread"
     };
 
