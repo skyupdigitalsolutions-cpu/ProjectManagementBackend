@@ -120,7 +120,7 @@ router.post('/send', protect, async (req, res) => {
   const creds = await credsFor(req.user._id);
   if (!creds) return res.status(400).json({ message: 'Mailbox not connected' });
   try {
-    const data = await sendMessage(creds, req.body || {});
+    const data = await sendMessage(creds, { ...(req.body || {}), fromName: req.user.name });
     res.json({ data });
   } catch (e) {
     // Full detail in Render logs so SMTP failures are diagnosable

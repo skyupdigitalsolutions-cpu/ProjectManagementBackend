@@ -1,28 +1,30 @@
 // services/mailservice.js  (CommonJS)
-// Hostinger webmail bridge: read (IMAP), send/reply/forward (SMTP),
-// folders, search, contacts, and save-to-Sent.
+// Hostinger webmail bridge.
+//   READ  over IMAP  (imapflow)  — folders, list, search, read, delete, contacts
+//   SEND  over Brevo HTTPS API   — because this host BLOCKS outbound SMTP ports
+//   SAVE-TO-SENT over IMAP APPEND (SMTP never saves to Sent by itself)
 //
-// deps:  npm i imapflow mailparser nodemailer
+// deps:  npm i imapflow mailparser nodemailer @getbrevo/brevo
+//
+// Sending requires BREVO_API_KEY in env, and the sender's DOMAIN must be
+// authenticated in Brevo (SPF/DKIM) — the same domain you already send with.
 
 const { ImapFlow }     = require('imapflow');
 const { simpleParser } = require('mailparser');
-const nodemailer       = require('nodemailer');
 const MailComposer     = require('nodemailer/lib/mail-composer');
+const { BrevoClient, BrevoEnvironment } = require('@getbrevo/brevo');
 
 const IMAP = {
   host: process.env.HOSTINGER_IMAP_HOST || 'imap.hostinger.com',
   port: Number(process.env.HOSTINGER_IMAP_PORT) || 993,
   secure: true,
 };
-const SMTP_HOST = process.env.HOSTINGER_SMTP_HOST || 'smtp.hostinger.com';
-const SMTP_PORT = Number(process.env.HOSTINGER_SMTP_PORT) || 465;
 
 function imapClient({ email, password }) {
   return new ImapFlow({
     ...IMAP,
     auth: { user: email, pass: password },
     logger: false,
-    // fail fast instead of hanging the request/gateway
     connectionTimeout: 15000,
     greetingTimeout: 10000,
     socketTimeout: 30000,
@@ -42,11 +44,8 @@ async function listFolders(creds) {
   const client = imapClient(creds);
   await client.connect();
   let list = [];
-  try {
-    list = await client.list();
-  } finally {
-    await client.logout();
-  }
+  try { list = await client.list(); }
+  finally { await client.logout(); }
   return list
     .filter((f) => !f.flags || !f.flags.has('\\Noselect'))
     .map((f) => ({
@@ -63,7 +62,6 @@ async function listMessages(creds, { box = 'INBOX', limit = 40, search = '' } = 
   const out = [];
   const lock = await client.getMailboxLock(box);
   try {
-    let seq;
     if (search && search.trim()) {
       const q = search.trim();
       const uids = await client.search(
@@ -71,7 +69,7 @@ async function listMessages(creds, { box = 'INBOX', limit = 40, search = '' } = 
         { uid: true }
       );
       if (!uids || uids.length === 0) return [];
-      seq = uids.slice(-limit); // newest matches
+      const seq = uids.slice(-limit);
       for await (const msg of client.fetch(seq, {
         uid: true, envelope: true, flags: true, internalDate: true,
       }, { uid: true })) {
@@ -174,7 +172,6 @@ async function getContacts(creds, perBox = 200) {
     const sent = folders.find((f) => f.specialUse === '\\Sent');
     const boxes = ['INBOX'];
     if (sent) boxes.push(sent.path);
-
     for (const box of boxes) {
       const lock = await client.getMailboxLock(box);
       try {
@@ -183,10 +180,7 @@ async function getContacts(creds, perBox = 200) {
           const start = Math.max(1, total - perBox + 1);
           for await (const msg of client.fetch(`${start}:*`, { envelope: true })) {
             const env = msg.envelope || {};
-            const people = []
-              .concat(env.from || [])
-              .concat(env.to || [])
-              .concat(env.cc || []);
+            const people = [].concat(env.from || []).concat(env.to || []).concat(env.cc || []);
             for (const p of people) {
               if (!p || !p.address) continue;
               const key = p.address.toLowerCase();
@@ -197,67 +191,79 @@ async function getContacts(creds, perBox = 200) {
             }
           }
         }
-      } finally {
-        lock.release();
-      }
+      } finally { lock.release(); }
     }
-  } finally {
-    await client.logout();
-  }
+  } finally { await client.logout(); }
   const me = creds.email.toLowerCase();
   return [...map.values()]
     .filter((c) => c.address.toLowerCase() !== me)
     .sort((a, b) => b.count - a.count || a.address.localeCompare(b.address));
 }
 
-// ── send (with 465 → 587 fallback), then append to Sent ────────────
+// ── send over Brevo HTTPS (SMTP is blocked on this host) ───────────
+function parseAddrs(input) {
+  if (!input) return [];
+  const arr = Array.isArray(input) ? input : String(input).split(',');
+  return arr
+    .map((s) => {
+      const m = String(s).match(/<([^>]+)>/);
+      const email = (m ? m[1] : s).trim();
+      return email ? { email } : null;
+    })
+    .filter(Boolean);
+}
+
 async function sendMessage(creds, {
-  to, cc, bcc, subject, text, html, inReplyTo, references, attachments,
+  to, cc, bcc, subject, text, html, inReplyTo, references, attachments, fromName,
 }) {
+  if (!process.env.BREVO_API_KEY) {
+    const e = new Error('BREVO_API_KEY is not set — cannot send mail (SMTP is blocked on this host).');
+    e.code = 'ENOCONFIG';
+    throw e;
+  }
+  const toArr = parseAddrs(to);
+  if (toArr.length === 0) { const e = new Error('No valid recipient address'); e.code = 'ENORCPT'; throw e; }
+
+  const payload = {
+    sender: { email: creds.email, name: fromName || creds.email },
+    replyTo: { email: creds.email, name: fromName || creds.email },
+    to: toArr,
+    subject: subject || '(no subject)',
+    textContent: text && text.trim() ? text : ' ',
+    htmlContent: html && html.trim() ? html : (text ? text.replace(/\n/g, '<br>') : ' '),
+  };
+  const ccArr = parseAddrs(cc); if (ccArr.length) payload.cc = ccArr;
+  const bccArr = parseAddrs(bcc); if (bccArr.length) payload.bcc = bccArr;
+  const brevoAtt = (attachments || []).map((a) => ({ name: a.filename, content: a.content }));
+  if (brevoAtt.length) payload.attachment = brevoAtt;
+  const headers = {};
+  if (inReplyTo) headers['In-Reply-To'] = inReplyTo;
+  if (references && references.length) headers['References'] = references.join(' ');
+  if (Object.keys(headers).length) payload.headers = headers;
+
+  const client = new BrevoClient({ apiKey: process.env.BREVO_API_KEY, environment: BrevoEnvironment.Production });
+  const result = await client.transactionalEmails.sendTransacEmail(payload);
+
+  // best-effort: save a copy to the Sent folder over IMAP
+  await appendToSent(creds, { to, cc, subject, text, html, attachments, inReplyTo, references }).catch(() => {});
+
+  return { messageId: (result && result.messageId) || null, via: 'brevo' };
+}
+
+async function appendToSent(creds, m) {
   const mailOptions = {
     from: creds.email,
-    to, cc, bcc, subject,
-    text: text || undefined,
-    html: html || undefined,
-    inReplyTo: inReplyTo || undefined,
-    references: references && references.length ? references : undefined,
-    attachments: (attachments || []).map((a) => ({
+    to: m.to, cc: m.cc, subject: m.subject,
+    text: m.text || undefined,
+    html: m.html || undefined,
+    inReplyTo: m.inReplyTo || undefined,
+    references: m.references && m.references.length ? m.references : undefined,
+    attachments: (m.attachments || []).map((a) => ({
       filename: a.filename,
       content: Buffer.from(a.content, 'base64'),
       contentType: a.contentType,
     })),
   };
-
-  // Try the configured port first, then the other common Hostinger port.
-  const primary = { host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465 };
-  const alt = SMTP_PORT === 465
-    ? { host: SMTP_HOST, port: 587, secure: false, requireTLS: true }
-    : { host: SMTP_HOST, port: 465, secure: true };
-
-  const CONN_ERRS = ['ETIMEDOUT', 'ECONNECTION', 'ESOCKET', 'ECONNREFUSED', 'EDNS', 'ETLS'];
-  let lastErr;
-  for (const cfg of [primary, alt]) {
-    try {
-      const transporter = nodemailer.createTransport({
-        ...cfg,
-        auth: { user: creds.email, pass: creds.password },
-        connectionTimeout: 15000,
-        greetingTimeout: 10000,
-        socketTimeout: 30000,
-      });
-      const info = await transporter.sendMail(mailOptions);
-      // best-effort: save a copy to the Sent folder (SMTP does not do this)
-      await appendToSent(creds, mailOptions).catch(() => {});
-      return { messageId: info.messageId, accepted: info.accepted, port: cfg.port };
-    } catch (e) {
-      lastErr = e;
-      if (!CONN_ERRS.includes(e.code)) throw e; // auth/other errors: don't retry
-    }
-  }
-  throw lastErr;
-}
-
-async function appendToSent(creds, mailOptions) {
   const raw = await new Promise((resolve, reject) => {
     new MailComposer(mailOptions).compile().build((err, msg) => (err ? reject(err) : resolve(msg)));
   });
@@ -266,19 +272,13 @@ async function appendToSent(creds, mailOptions) {
   try {
     const folders = await client.list();
     const sent = folders.find((f) => f.specialUse === '\\Sent');
-    const target = sent ? sent.path : 'INBOX.Sent';
-    await client.append(target, raw, ['\\Seen']);
+    await client.append(sent ? sent.path : 'INBOX.Sent', raw, ['\\Seen']);
   } finally {
     await client.logout();
   }
 }
 
 module.exports = {
-  verifyMailbox,
-  listFolders,
-  listMessages,
-  getMessage,
-  deleteMessage,
-  getContacts,
-  sendMessage,
+  verifyMailbox, listFolders, listMessages, getMessage,
+  deleteMessage, getContacts, sendMessage,
 };
