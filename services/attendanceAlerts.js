@@ -21,8 +21,10 @@
  *   WORK_START              "09:00"   scheduled office start time (HH:MM, IST)
  *   LATE_GRACE_MINUTES      15        minutes after start before "late" kicks in
  *   STANDARD_WORK_HOURS     8         fallback daily hours (user.dailyWorkingHours wins)
- *   STANDARD_BREAK_MINUTES  60        unpaid break assumed when no app breaks logged
- *                                     (biometric records don't push break punches)
+ *   OVERTIME_INCLUDE_BREAKS "true"    breaks/lunch count as working time (OT = span − 8h).
+ *                                     set "false" to subtract breaks before counting OT.
+ *   STANDARD_BREAK_MINUTES  60        break subtracted ONLY when INCLUDE_BREAKS=false and
+ *                                     no app breaks were logged (e.g. biometric records)
  *   OVERTIME_MIN_MINUTES    15        ignore OT smaller than this (noise filter)
  *   TELEGRAM_LOGIN_PINGS    "true"    set "false" to disable the real-time login ping
  */
@@ -48,6 +50,10 @@ function cfg() {
     standardBreakMin: num(process.env.STANDARD_BREAK_MINUTES, 60),
     overtimeMinMinutes: num(process.env.OVERTIME_MIN_MINUTES, 15),
     loginPings: String(process.env.TELEGRAM_LOGIN_PINGS ?? "true").toLowerCase() !== "false",
+    // When true (default), lunch/breaks count as working time: overtime is simply
+    // (clock-out − clock-in) − standard hours. Set "false" to subtract breaks
+    // (app-logged breaks, or STANDARD_BREAK_MINUTES for biometric records).
+    includeBreaks: String(process.env.OVERTIME_INCLUDE_BREAKS ?? "true").toLowerCase() !== "false",
   };
 }
 
@@ -118,10 +124,11 @@ function computeWorkStats(record, user = {}) {
 
   const grossHours = num(record.hours_worked, 0);
 
-  // Use app-tracked breaks if present; otherwise assume the standard unpaid
-  // break so a normal 9-to-6 day (9h gross) isn't mistaken for overtime.
+  // Overtime basis. By default lunch/breaks count as working time, so we use
+  // the full clock-in→clock-out span. If OVERTIME_INCLUDE_BREAKS=false, subtract
+  // app-logged breaks (or the standard break for biometric records with none).
   const appBreak = num(record.break_minutes, 0);
-  const breakMinutes = appBreak > 0 ? appBreak : c.standardBreakMin;
+  const breakMinutes = c.includeBreaks ? 0 : (appBreak > 0 ? appBreak : c.standardBreakMin);
 
   const netHours = record.clock_out ? Math.max(0, grossHours - breakMinutes / 60) : 0;
   const extraMinutes = record.clock_out
