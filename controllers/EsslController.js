@@ -14,6 +14,7 @@
 
 const Attendance = require("../models/attendance");
 const User = require("../models/users");
+const { handleClockInAlert, handleClockOutAlert } = require("../services/attendanceAlerts");
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
@@ -65,7 +66,8 @@ const decodeVerifyMethod = (verifyCode) => {
  *   last  punch  → clock_out   (2nd/4th/… punches are outs; last one wins)
  * A single punch = clocked in but not out yet (clock_out stays null).
  */
-const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSerial) => {
+const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial) => {
+  const userId = user._id;
   const date = toMidnight(dateObj);
 
   // 1. Load punches already stored for this user/day (full-day picture).
@@ -125,6 +127,16 @@ const upsertAttendanceFromPunches = async (userId, dateObj, punches, deviceSeria
     },
     { upsert: true, returnDocument: "after", runValidators: true }
   );
+
+  // ─── Fire attendance alerts on state transitions ─────────────────────────
+  // Login ping: only when this is the first punch of the day (record is new).
+  if (!existing) {
+    handleClockInAlert(record, user).catch(() => {});
+  }
+  // Overtime alert: only when a clock-out was just derived (wasn't set before).
+  if (record.clock_out && !existing?.clock_out) {
+    handleClockOutAlert(record, user).catch(() => {});
+  }
 
   return record;
 };
@@ -217,7 +229,7 @@ const admsReceiver = async (req, res) => {
       }
 
       try {
-        await upsertAttendanceFromPunches(user._id, new Date(dateStr), punches, deviceSerial);
+        await upsertAttendanceFromPunches(user, new Date(dateStr), punches, deviceSerial);
         results.saved++;
         console.log(`[eSSL] Saved attendance for ${user.name} (fp:${fpId}) on ${dateStr}`);
       } catch (err) {
@@ -308,7 +320,7 @@ const syncFromDevice = async (req, res) => {
       }
 
       try {
-        await upsertAttendanceFromPunches(user._id, new Date(dateStr), punches, device_serial || ip);
+        await upsertAttendanceFromPunches(user, new Date(dateStr), punches, device_serial || ip);
         results.saved++;
       } catch (err) {
         results.errors.push({ fpId, dateStr, error: err.message });

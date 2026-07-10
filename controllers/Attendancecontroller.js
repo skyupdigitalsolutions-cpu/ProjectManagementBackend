@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const Attendance = require("../models/attendance");
 const WfhRequest = require("../models/WfhRequest");
+const { handleClockInAlert, handleClockOutAlert, sendDailyAttendanceDigest } = require("../services/attendanceAlerts");
+const { sendTelegramMessage, isConfigured } = require("../services/telegram");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -118,6 +120,9 @@ const clockIn = async (req, res) => {
       source: elig.via === "wfh" ? "wfh" : "manual",
     });
 
+    // Real-time Telegram login ping (fire-and-forget; never blocks the response).
+    handleClockInAlert(record, req.user).catch(() => {});
+
     return res.status(201).json({ success: true, message: "Clocked in successfully", data: record });
   } catch (error) {
     return handleError(res, error);
@@ -161,6 +166,9 @@ const clockOut = async (req, res) => {
     record.hours_worked = hours_worked;
     record.status = status;
     await record.save();
+
+    // Alert admins (in-app + Telegram) if this was an overtime day.
+    handleClockOutAlert(record, req.user).catch(() => {});
 
     return res.status(200).json({ success: true, message: "Clocked out successfully", data: record });
   } catch (error) {
@@ -324,7 +332,7 @@ const getUserAttendance = async (req, res) => {
 
     const [records, total] = await Promise.all([
       Attendance.find(filter)
-        .populate("user_id", "name email department designation")
+        .populate("user_id", "name email department designation dailyWorkingHours")
         .sort({ date: -1 })
         .skip(skip)
         .limit(Number(limit)),
@@ -362,7 +370,7 @@ const getAllAttendance = async (req, res) => {
 
     const [records, total] = await Promise.all([
       Attendance.find(filter)
-        .populate("user_id", "name email department designation")
+        .populate("user_id", "name email department designation dailyWorkingHours")
         .sort({ date: -1, createdAt: -1 })
         .skip(skip)
         .limit(Number(limit)),
@@ -526,6 +534,58 @@ const getMonthlySummary = async (req, res) => {
   }
 };
 
+// ─── TELEGRAM (Admin) ─────────────────────────────────────────────────────────
+
+/**
+ * POST /attendance/telegram/test
+ * Admin only — sends a test message to verify Telegram is wired up correctly.
+ */
+const testTelegram = async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(400).json({
+        success: false,
+        message: "Telegram not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.",
+      });
+    }
+    const result = await sendTelegramMessage(
+      "✅ <b>SkyUp PM</b> — Telegram attendance alerts are connected."
+    );
+    if (!result.ok) {
+      return res.status(502).json({ success: false, message: result.error || "Send failed" });
+    }
+    return res.status(200).json({ success: true, message: "Test message sent to Telegram" });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+/**
+ * POST /attendance/telegram/digest?date=YYYY-MM-DD
+ * Admin only — sends the daily attendance digest immediately (default: today).
+ */
+const sendDigestNow = async (req, res) => {
+  try {
+    const when = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(when)) {
+      return res.status(400).json({ success: false, message: "Invalid date" });
+    }
+    const result = await sendDailyAttendanceDigest(when);
+    if (result.skipped) {
+      return res.status(400).json({
+        success: false,
+        message: "Telegram not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.",
+      });
+    }
+    if (!result.ok) {
+      return res.status(502).json({ success: false, message: result.error || "Send failed" });
+    }
+    return res.status(200).json({ success: true, message: "Digest sent", counts: result.counts });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
 module.exports = {
   clockIn,
   clockOut,
@@ -538,4 +598,6 @@ module.exports = {
   updateAttendanceRecord,
   markAbsent,
   getMonthlySummary,
+  testTelegram,
+  sendDigestNow,
 };

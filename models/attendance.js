@@ -73,6 +73,18 @@ const AttendanceSchema = mongoose.Schema(
       type: [RawLogSchema],
       default: [],
     },
+
+    // ─── Alert guards ──────────────────────────────────────────────────────
+    // Prevent duplicate Telegram/in-app alerts when the biometric device
+    // re-sends the same punches on every ADMS interval.
+    login_notified: {
+      type: Boolean,
+      default: false,      // real-time "clocked in" ping already sent
+    },
+    overtime_alerted: {
+      type: Boolean,
+      default: false,      // overtime alert already sent for this record
+    },
   },
   { timestamps: true }
 );

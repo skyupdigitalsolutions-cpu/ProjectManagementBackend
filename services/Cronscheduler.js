@@ -24,6 +24,7 @@ const Notification = require('../models/notification');
 const { rebalanceTasks } = require('./autoAssignService');
 const { annotateLockState, stampUnlocks, durationDays } = require('./phaseGate');
 const { notifyAdmins } = require('./notify');
+const { sendDailyAttendanceDigest } = require('./attendanceAlerts');
 const log = require('./assignmentLogger');
 
 // ─── Brevo client factory (mirrors emailController.js pattern) ────────────────
@@ -258,6 +259,28 @@ async function runRebalanceJob() {
   }
 }
 
+// ─── JOB 5: Daily attendance digest to Telegram ──────────────────────────────
+
+/**
+ * Posts one consolidated Telegram message with every employee's login timing
+ * for today — marking who was late and who did overtime. Runs end-of-day so
+ * clock-outs (and therefore overtime) are already recorded.
+ */
+async function runAttendanceDigestJob() {
+  try {
+    const result = await sendDailyAttendanceDigest(new Date());
+    if (result.skipped) {
+      console.log('[CRON] Attendance digest skipped (Telegram not configured)');
+    } else if (result.ok) {
+      console.log('[CRON] Attendance digest sent', result.counts || {});
+    } else {
+      console.warn('[CRON] Attendance digest failed:', result.error);
+    }
+  } catch (err) {
+    console.error('[CRON] Attendance digest job failed:', err.message);
+  }
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 function initCronJobs() {
@@ -282,7 +305,15 @@ function initCronJobs() {
   // Every 6 hours: workload rebalance
   cron.schedule('0 */6 * * *', runRebalanceJob);
 
-  console.log('[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance');
+  // Daily attendance digest to Telegram.
+  // Default: 14:00 UTC = 19:30 IST (end of day). Override with ATTENDANCE_DIGEST_CRON.
+  const digestCron = process.env.ATTENDANCE_DIGEST_CRON || '0 14 * * *';
+  cron.schedule(digestCron, () => {
+    console.log('[CRON] Attendance digest job starting at', new Date().toISOString());
+    runAttendanceDigestJob();
+  });
+
+  console.log(`[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance | attendance digest (${digestCron})`);
 }
 
 module.exports = {
@@ -291,4 +322,5 @@ module.exports = {
   sendDailyTaskNotifications,
   alertAdminsAboutOverdue,
   runRebalanceJob,
+  runAttendanceDigestJob,
 };

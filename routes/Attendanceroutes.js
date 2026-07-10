@@ -13,6 +13,8 @@ const {
   updateAttendanceRecord,
   markAbsent,
   getMonthlySummary,
+  testTelegram,
+  sendDigestNow,
 } = require("../controllers/Attendancecontroller");
 const { protect, authorise } = require("../middleware/authMiddleware");
 
@@ -24,6 +26,8 @@ router.patch("/break/end",            protect, endBreak);
 router.get("/today",                  protect, getTodayStatus);
 router.get("/my",                     protect, getMyAttendance);
 router.post("/mark-absent",           protect, authorise("admin", "manager"), markAbsent);
+router.post("/telegram/test",         protect, authorise("admin"), testTelegram);
+router.post("/telegram/digest",       protect, authorise("admin"), sendDigestNow);
 router.get("/summary/:user_id",       protect, getMonthlySummary);
 router.get("/user/:user_id",          protect, authorise("admin", "manager"), getUserAttendance);
 router.get("/",                       protect, authorise("admin", "manager"), getAllAttendance);
