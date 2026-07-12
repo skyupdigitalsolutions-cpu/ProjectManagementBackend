@@ -4,6 +4,19 @@ const helmet   = require('helmet');
 const morgan   = require('morgan');
 require('dotenv').config();
 
+// ─── Crash guards ─────────────────────────────────────────────────────────────
+// A single uncaught error (e.g. an IMAP socket 'error' event with no listener,
+// or a stray rejected promise) must NOT be able to take the whole API down for
+// every user. Log it loudly so it appears in the host logs, and keep serving.
+// This also turns silent process deaths into a readable stack trace you can act
+// on. (A truly fatal state will still surface; the host can restart if needed.)
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
 const routes = require('./routes/Index');
 
 const {

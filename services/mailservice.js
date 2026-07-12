@@ -21,7 +21,7 @@ const IMAP = {
 };
 
 function imapClient({ email, password }) {
-  return new ImapFlow({
+  const client = new ImapFlow({
     ...IMAP,
     auth: { user: email, pass: password },
     logger: false,
@@ -29,6 +29,19 @@ function imapClient({ email, password }) {
     greetingTimeout: 10000,
     socketTimeout: 30000,
   });
+  // ImapFlow is an EventEmitter. If the underlying TCP socket errors — the host
+  // resets the connection, blocks outbound port 993, times out, etc. — and
+  // NOTHING is listening for 'error', Node re-throws it as an uncaughtException
+  // and the ENTIRE server process dies (taking every other user's requests with
+  // it). This no-op logging listener keeps that error local: the in-flight
+  // operation still rejects and is handled by the route's own try/catch.
+  client.on('error', (err) => {
+    console.error(
+      '[mail] imap client error:',
+      err && err.message ? err.message : err,
+    );
+  });
+  return client;
 }
 
 // ── credential check ───────────────────────────────────────────────
