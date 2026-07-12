@@ -26,7 +26,11 @@ router.post('/connect', protect, async (req, res) => {
     await verifyMailbox({ email, password });
   } catch (e) {
     console.error('[mail] connect failed:', e.code, e.message);
-    return res.status(401).json({ message: 'Could not sign in to that mailbox. Check the email and password.' });
+    // NOTE: use 400 (not 401) here. A 401 means "your APP session expired" and
+    // the frontend's global axios interceptor logs the user out on any 401. This
+    // failure is a MAILBOX credential problem, not an app-auth problem, so it
+    // must not trigger that logout. 400 lets the Mail page show the real error.
+    return res.status(400).json({ message: 'Could not sign in to that mailbox. Check the email and password.' });
   }
   await User.findByIdAndUpdate(req.user._id, {
     mail_config: { email, password_enc: encrypt(password) },
