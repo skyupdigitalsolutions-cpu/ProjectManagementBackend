@@ -42,6 +42,8 @@ const NotificationSchema = mongoose.Schema(
         "leave_requested",        // employee applied for leave
         "wfh_requested",          // employee submitted a WFH request
         "daily_report_submitted", // employee submitted their daily report
+        // ── NEW: morning reminder of what the employee planned for today ────
+        "daily_plan_reminder",    // "good morning — here's your plan for today"
       ],
       required: true,
     },

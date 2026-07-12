@@ -21,6 +21,7 @@ const Brevo        = require('@getbrevo/brevo');
 const Task         = require('../models/tasks');
 const User         = require('../models/users');
 const Notification = require('../models/notification');
+const DailyReport  = require('../models/Dailyreport');
 const { rebalanceTasks } = require('./autoAssignService');
 const { annotateLockState, stampUnlocks, durationDays } = require('./phaseGate');
 const { notifyAdmins } = require('./notify');
@@ -216,6 +217,76 @@ async function sendDailyTaskNotifications() {
   console.log(`[CRON] Notifications: ${Object.keys(byEmployee).length} in-app, ${emailsSent} emails via Brevo`);
 }
 
+// ─── JOB 2b: Morning "your plan for today" reminder ──────────────────────────
+
+/**
+ * Surfaces the `plan_for_tomorrow` an employee wrote in a PREVIOUS day's daily
+ * report as an in-app notification the next morning:
+ *   "Good morning — here's what you planned for today: …"
+ *
+ * Idempotent: each report is reminded at most once (plan_reminder_sent flag), so
+ * re-runs (or a missed day the job later catches up on) never double-notify.
+ * Only reports dated strictly before today are considered, so a report the
+ * employee submits *today* (whose plan is for tomorrow) isn't surfaced today.
+ * If an employee has several un-reminded reports (e.g. the job missed a day),
+ * only their most recent plan is shown as "today's plan"; the older ones are
+ * still flagged so they don't resurface later.
+ */
+async function sendPlanForTodayReminders() {
+  const start = todayStart(); // today 00:00
+
+  const reports = await DailyReport.find({
+    date:               { $lt: start },
+    plan_reminder_sent: { $ne: true },
+    plan_for_tomorrow:  { $exists: true, $nin: [null, ''] },
+  })
+    .sort({ date: -1 })
+    .populate('user_id', 'name status');
+
+  if (!reports.length) {
+    console.log('[CRON] No pending plan-for-today reminders');
+    return;
+  }
+
+  const notifiedUsers = new Set();
+  const processedIds  = [];
+  let   created       = 0;
+
+  for (const r of reports) {
+    processedIds.push(r._id); // every processed report gets flagged, notified or not
+
+    const user = r.user_id;
+    const uid  = user && user._id ? user._id.toString() : null;
+    if (!uid) continue;
+    if (notifiedUsers.has(uid)) continue;            // keep only the latest plan per user
+    notifiedUsers.add(uid);
+
+    if (user.status && user.status !== 'active') continue; // skip inactive, still flag
+
+    const plan = (r.plan_for_tomorrow || '').trim();
+    if (!plan) continue;
+
+    await Notification.create({
+      user_id:   user._id,
+      sender_id: null,
+      message:   `🗓️ Good morning${user.name ? ', ' + user.name : ''}! Here's what you planned for today:\n${plan}`,
+      type:      'daily_plan_reminder',
+      ref_id:    r._id,
+      ref_type:  null,
+    }).catch(console.error);
+    created += 1;
+  }
+
+  if (processedIds.length) {
+    await DailyReport.updateMany(
+      { _id: { $in: processedIds } },
+      { $set: { plan_reminder_sent: true } }
+    ).catch(console.error);
+  }
+
+  console.log(`[CRON] Plan-for-today reminders: ${created} sent to ${notifiedUsers.size} employee(s)`);
+}
+
 // ─── JOB 3: Alert admins about overdue ───────────────────────────────────────
 
 async function alertAdminsAboutOverdue() {
@@ -290,6 +361,7 @@ function initCronJobs() {
     try {
       await markOverdueTasks();
       await sendDailyTaskNotifications();
+      await sendPlanForTodayReminders();
       await alertAdminsAboutOverdue();
     } catch (err) {
       console.error('[CRON] Daily job failed:', err.message);
@@ -320,6 +392,7 @@ module.exports = {
   initCronJobs,
   markOverdueTasks,
   sendDailyTaskNotifications,
+  sendPlanForTodayReminders,
   alertAdminsAboutOverdue,
   runRebalanceJob,
   runAttendanceDigestJob,

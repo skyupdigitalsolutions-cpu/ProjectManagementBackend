@@ -32,6 +32,12 @@ const DailyReportSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    // Set true once the morning "here's your plan for today" reminder has been
+    // sent for this report, so the cron job never notifies the same plan twice.
+    plan_reminder_sent: {
+      type: Boolean,
+      default: false,
+    },
     mood: {
       type: String,
       enum: ["great", "good", "okay", "struggling"],
