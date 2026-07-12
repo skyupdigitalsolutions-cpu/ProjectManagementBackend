@@ -1,6 +1,5 @@
 const express  = require('express');
 const mongoose = require('mongoose');
-const cors     = require('cors');
 const helmet   = require('helmet');
 const morgan   = require('morgan');
 require('dotenv').config();
@@ -15,9 +14,52 @@ const {
 
 const app = express();
 
+// ─── CORS (explicit, proxy-proof) ─────────────────────────────────────────────
+// Registered FIRST so the OPTIONS preflight is answered before helmet / routes
+// ever run. Reflects the request Origin when it's on the allow-list, echoes the
+// requested headers, and short-circuits preflight with a 204. Set CORS_ORIGINS
+// in the environment (comma-separated) to add/override allowed origins; use "*"
+// to allow any origin (note: "*" cannot be combined with credentials per spec).
+const ALLOWED_ORIGINS = (
+  process.env.CORS_ORIGINS ||
+  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com'
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowAny = ALLOWED_ORIGINS.includes('*');
+
+  if (origin && (allowAny || ALLOWED_ORIGINS.includes(origin))) {
+    // Reflect the specific origin (required when credentials are used).
+    res.header('Access-Control-Allow-Origin', allowAny ? '*' : origin);
+    res.header('Vary', 'Origin');
+    if (!allowAny) res.header('Access-Control-Allow-Credentials', 'true');
+    res.header(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+    );
+    // Echo whatever headers the browser asked for (falls back to the usual set).
+    res.header(
+      'Access-Control-Allow-Headers',
+      req.headers['access-control-request-headers'] ||
+        'Authorization,Content-Type',
+    );
+    res.header('Access-Control-Max-Age', '86400');
+  }
+
+  // Answer the preflight immediately — nothing downstream needs to run.
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(helmet());
-app.use(cors({ origin: true, credentials: true }));
+// crossOriginResourcePolicy is disabled so helmet's default
+// "Cross-Origin-Resource-Policy: same-origin" doesn't interfere with the API
+// being consumed from the separate frontend origin.
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
