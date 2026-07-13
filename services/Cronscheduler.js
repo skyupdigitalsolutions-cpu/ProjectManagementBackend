@@ -26,6 +26,7 @@ const { rebalanceTasks } = require('./autoAssignService');
 const { annotateLockState, stampUnlocks, durationDays } = require('./phaseGate');
 const { notifyAdmins } = require('./notify');
 const { sendDailyAttendanceDigest } = require('./attendanceAlerts');
+const { sendTrackerDigest } = require('./trackerDigest');
 const log = require('./assignmentLogger');
 
 // ─── Brevo client factory (mirrors emailController.js pattern) ────────────────
@@ -354,6 +355,21 @@ async function runAttendanceDigestJob() {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
+async function runTrackerDigestJob() {
+  try {
+    const result = await sendTrackerDigest(new Date());
+    if (result.skipped) {
+      console.log('[CRON] Tracker digest skipped:', result.error);
+    } else if (result.ok) {
+      console.log('[CRON] Tracker digest sent', { chats: result.chats, sent: result.sent, failed: result.failed });
+    } else {
+      console.warn('[CRON] Tracker digest failed:', result.error);
+    }
+  } catch (err) {
+    console.error('[CRON] Tracker digest job failed:', err.message);
+  }
+}
+
 function initCronJobs() {
   // 9 AM daily
   cron.schedule('0 9 * * *', async () => {
@@ -385,7 +401,16 @@ function initCronJobs() {
     runAttendanceDigestJob();
   });
 
-  console.log(`[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance | attendance digest (${digestCron})`);
+  // Daily tracker (desktop activity) digest to Telegram — sent to every chat id
+  // in TELEGRAM_TRACKER_CHAT_IDS. Default: 14:15 UTC = 19:45 IST (end of day).
+  // Override with TRACKER_DIGEST_CRON.
+  const trackerDigestCron = process.env.TRACKER_DIGEST_CRON || '15 14 * * *';
+  cron.schedule(trackerDigestCron, () => {
+    console.log('[CRON] Tracker digest job starting at', new Date().toISOString());
+    runTrackerDigestJob();
+  });
+
+  console.log(`[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance | attendance digest (${digestCron}) | tracker digest (${trackerDigestCron})`);
 }
 
 module.exports = {
@@ -396,4 +421,5 @@ module.exports = {
   alertAdminsAboutOverdue,
   runRebalanceJob,
   runAttendanceDigestJob,
+  runTrackerDigestJob,
 };

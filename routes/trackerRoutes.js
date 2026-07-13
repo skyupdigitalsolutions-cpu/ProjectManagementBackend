@@ -26,6 +26,7 @@ const Attendance = require('../models/attendance');
 const ActivityLog = require('../models/ActivityLog');
 const AppCategory = require('../models/AppCategory');
 const { classifyBatch } = require('../services/classificationService');
+const { buildTrackerDigest, sendTrackerDigest } = require('../services/trackerDigest');
 const TrackerDevice = require('../models/TrackerDevice');
 const { protect, authorise } = require('../middleware/authMiddleware');
 
@@ -478,6 +479,36 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
   } catch (err) {
     console.error('Tracker employee-summary error:', err);
     res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── GET /api/tracker/digest/preview?date=YYYY-MM-DD ──────────────────────────
+// Returns the exact Telegram text that would be broadcast (no message is sent).
+router.get('/digest/preview', protect, authorise('admin', 'manager'), async (req, res) => {
+  try {
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+    const { text, counts } = await buildTrackerDigest(date);
+    return res.json({ success: true, counts, text });
+  } catch (err) {
+    console.error('Tracker digest preview error:', err);
+    return res.status(500).json({ success: false, message: 'Preview failed' });
+  }
+});
+
+// ─── POST /api/tracker/digest/send?date=YYYY-MM-DD ────────────────────────────
+// Builds the per-employee summary and broadcasts it to every configured
+// Telegram chat (TELEGRAM_TRACKER_CHAT_IDS, falling back to TELEGRAM_CHAT_ID).
+router.post('/digest/send', protect, authorise('admin'), async (req, res) => {
+  try {
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+    const result = await sendTrackerDigest(date);
+    const code = result.ok ? 200 : (result.skipped ? 400 : 502);
+    return res.status(code).json({ success: result.ok, ...result });
+  } catch (err) {
+    console.error('Tracker digest send error:', err);
+    return res.status(500).json({ success: false, message: 'Send failed' });
   }
 });
 
