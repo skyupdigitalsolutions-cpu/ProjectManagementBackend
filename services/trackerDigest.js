@@ -1,18 +1,21 @@
 /**
  * services/trackerDigest.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Builds a per-employee summary of desktop-tracker activity for a given day and
- * broadcasts it to ONE OR MORE Telegram chats.
+ * Builds a detailed per-employee summary of desktop-tracker activity for a given
+ * day and broadcasts it to ONE OR MORE Telegram chats.
+ *
+ * Each employee block shows:
+ *   - tracked time, idle time, and the active window (first → last activity)
+ *   - productive / neutral / unproductive breakdown (with a productive %)
+ *   - the top apps they spent time in
+ *   - the projects they logged time against
  *
  * Multiple destinations
  *   Set TELEGRAM_TRACKER_CHAT_IDS to a comma-separated list of chat ids, e.g.
- *       TELEGRAM_TRACKER_CHAT_IDS=-1001111111111,222222222,333333333
- *   Each id can be a group (negative) or a personal DM chat id. If it isn't set,
- *   the digest falls back to TELEGRAM_CHAT_ID (the same default the attendance
- *   alerts use). TELEGRAM_BOT_TOKEN is always required.
- *
- * The same numbers as the /api/tracker/summary dashboard endpoint are used, so
- * the digest and the dashboard never disagree.
+ *       TELEGRAM_TRACKER_CHAT_IDS=-1004364279119,222222222
+ *   Each id can be a group/supergroup (negative) or a personal DM chat id. If it
+ *   isn't set, the digest falls back to TELEGRAM_CHAT_ID. TELEGRAM_BOT_TOKEN is
+ *   always required.
  *
  * Never throws — a Telegram/DB failure here must not crash a cron run.
  */
@@ -22,11 +25,12 @@ const User = require('../models/users');
 const { classifyBatch } = require('./classificationService');
 const { sendTelegramMessage, escapeHtml } = require('./telegram');
 
-const TELEGRAM_MAX = 4096;         // hard Telegram limit
-const CHUNK_TARGET = 3500;         // split well below the limit to be safe
+const TELEGRAM_MAX = 4096;   // hard Telegram limit
+const CHUNK_TARGET = 3500;   // split well below the limit to be safe
+const TOP_APPS = 4;          // how many apps to list per employee
+const TOP_PROJECTS = 3;      // how many projects to list per employee
 
 // ─── Destinations ───────────────────────────────────────────────────────────
-// Parse the comma-separated chat-id list (falls back to the single default id).
 function getChatIds() {
   const raw = process.env.TELEGRAM_TRACKER_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '';
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
@@ -39,7 +43,12 @@ function fmtDateIST(date = new Date()) {
     timeZone: 'Asia/Kolkata',
   });
 }
-
+function fmtTimeIST(date) {
+  if (!date) return '—';
+  return new Date(date).toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata',
+  });
+}
 function fmtDuration(totalSeconds) {
   const m = Math.max(0, Math.round(totalSeconds / 60));
   const h = Math.floor(m / 60);
@@ -50,22 +59,49 @@ function fmtDuration(totalSeconds) {
 }
 
 // ─── Aggregation ────────────────────────────────────────────────────────────
-// Mirrors the /api/tracker/summary aggregation: per user → tracked/idle and
-// productive/neutral/unproductive seconds, using the shared classifier.
+// Builds a rich per-employee record for the day. Uses the shared classifier so
+// productive/neutral/unproductive numbers match the dashboard.
 async function computePerEmployee(dateObj = new Date()) {
   const dayStart = new Date(dateObj); dayStart.setHours(0, 0, 0, 0);
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+  const match = { start: { $gte: dayStart, $lt: dayEnd } };
 
-  const rows = await ActivityLog.aggregate([
-    { $match: { start: { $gte: dayStart, $lt: dayEnd } } },
-    {
-      $group: {
-        _id: { user_id: '$user_id', app_name: '$app_name', window_title: '$window_title', is_idle: '$is_idle' },
-        seconds: { $sum: '$duration_sec' },
+  // 1) Time per user × app × title × idle  (drives totals + top apps).
+  // 2) First/last activity per user.
+  // 3) Time per user × project (task → project title).
+  const [rows, spanRows, projRows] = await Promise.all([
+    ActivityLog.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { user_id: '$user_id', app_name: '$app_name', window_title: '$window_title', is_idle: '$is_idle' },
+          seconds: { $sum: '$duration_sec' },
+        },
       },
-    },
+    ]),
+    ActivityLog.aggregate([
+      { $match: match },
+      { $group: { _id: '$user_id', first: { $min: '$start' }, last: { $max: '$end' } } },
+    ]),
+    ActivityLog.aggregate([
+      { $match: { ...match, is_idle: false, task_id: { $ne: null } } },
+      { $group: { _id: { user: '$user_id', task: '$task_id' }, seconds: { $sum: '$duration_sec' } } },
+      { $lookup: { from: 'tasks', localField: '_id.task', foreignField: '_id', as: 'task' } },
+      { $unwind: { path: '$task', preserveNullAndEmptyArrays: true } },
+      { $lookup: { from: 'projects', localField: 'task.project_id', foreignField: '_id', as: 'project' } },
+      { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { user: '$_id.user', project: '$project._id' },
+          project_title: { $first: '$project.title' },
+          seconds: { $sum: '$seconds' },
+        },
+      },
+      { $sort: { seconds: -1 } },
+    ]),
   ]);
 
+  // Classify the non-idle app/title pairs once.
   const pairs = rows
     .filter((r) => !r._id.is_idle)
     .map((r) => ({ app_name: r._id.app_name, window_title: r._id.window_title }));
@@ -73,28 +109,54 @@ async function computePerEmployee(dateObj = new Date()) {
   const classify = (app, title) => catMap.get(makeSignature(app, title)) || 'neutral';
 
   const perUser = {};
+  const appTotals = {}; // uid -> { appName -> seconds }
   for (const r of rows) {
     const uid = String(r._id.user_id);
     if (!perUser[uid]) {
       perUser[uid] = { user_id: uid, tracked: 0, idle: 0, productive: 0, neutral: 0, unproductive: 0 };
+      appTotals[uid] = {};
     }
     if (r._id.is_idle) {
       perUser[uid].idle += r.seconds;
     } else {
       perUser[uid].tracked += r.seconds;
       perUser[uid][classify(r._id.app_name, r._id.window_title)] += r.seconds;
+      const app = r._id.app_name || 'Unknown';
+      appTotals[uid][app] = (appTotals[uid][app] || 0) + r.seconds;
     }
   }
 
   const userIds = Object.keys(perUser);
   if (!userIds.length) return { rows: [], totals: { tracked: 0, idle: 0, productive: 0 } };
 
+  // Names, first/last, and projects lookups.
   const users = await User.find({ _id: { $in: userIds } }).select('name').lean();
   const nameMap = Object.fromEntries(users.map((u) => [String(u._id), u.name || 'Unknown']));
 
-  const list = Object.values(perUser)
-    .map((u) => ({ ...u, name: nameMap[u.user_id] || 'Unknown' }))
-    .sort((a, b) => b.tracked - a.tracked);
+  const spanMap = Object.fromEntries(spanRows.map((s) => [String(s._id), { first: s.first, last: s.last }]));
+
+  const projMap = {}; // uid -> [{title, seconds}]
+  for (const p of projRows) {
+    const uid = String(p._id.user);
+    if (!projMap[uid]) projMap[uid] = [];
+    projMap[uid].push({ title: p.project_title || 'Untagged', seconds: p.seconds });
+  }
+
+  const list = Object.values(perUser).map((u) => {
+    const uid = u.user_id;
+    const topApps = Object.entries(appTotals[uid] || {})
+      .map(([name, seconds]) => ({ name, seconds }))
+      .sort((a, b) => b.seconds - a.seconds)
+      .slice(0, TOP_APPS);
+    return {
+      ...u,
+      name: nameMap[uid] || 'Unknown',
+      first: spanMap[uid]?.first || null,
+      last: spanMap[uid]?.last || null,
+      topApps,
+      projects: (projMap[uid] || []).slice(0, TOP_PROJECTS),
+    };
+  }).sort((a, b) => b.tracked - a.tracked);
 
   const totals = list.reduce(
     (a, u) => ({ tracked: a.tracked + u.tracked, idle: a.idle + u.idle, productive: a.productive + u.productive }),
@@ -116,17 +178,22 @@ function buildText(dateObj, data) {
     : 0;
 
   const lines = [header, ''];
-  lines.push(
-    `👥 Team: ${data.rows.length} tracked · ${fmtDuration(data.totals.tracked)} total · ${teamPct}% productive`
-  );
-  lines.push('');
+  lines.push(`👥 ${data.rows.length} employees · ${fmtDuration(data.totals.tracked)} tracked · ${teamPct}% productive`);
 
   data.rows.forEach((u, i) => {
     const pct = u.tracked ? Math.round((u.productive / u.tracked) * 100) : 0;
+    lines.push('');
     lines.push(`${i + 1}. <b>${escapeHtml(u.name)}</b>`);
-    lines.push(
-      `   ⏱ ${fmtDuration(u.tracked)} tracked · ✅ ${pct}% productive · 💤 ${fmtDuration(u.idle)} idle`
-    );
+    lines.push(`   ⏱ ${fmtDuration(u.tracked)} tracked · 💤 ${fmtDuration(u.idle)} idle · 🕘 ${fmtTimeIST(u.first)}–${fmtTimeIST(u.last)}`);
+    lines.push(`   ✅ ${fmtDuration(u.productive)} (${pct}%) · ➖ ${fmtDuration(u.neutral)} · ⛔ ${fmtDuration(u.unproductive)}`);
+    if (u.topApps.length) {
+      const apps = u.topApps.map((a) => `${escapeHtml(a.name)} ${fmtDuration(a.seconds)}`).join(', ');
+      lines.push(`   🔝 ${apps}`);
+    }
+    if (u.projects.length) {
+      const projs = u.projects.map((p) => `${escapeHtml(p.title)} ${fmtDuration(p.seconds)}`).join(', ');
+      lines.push(`   📁 ${projs}`);
+    }
   });
 
   return { text: lines.join('\n'), counts: { employees: data.rows.length } };
@@ -150,17 +217,11 @@ function chunk(text) {
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
-
-/** Build (but do not send) the digest text for a day. Handy for a preview. */
 async function buildTrackerDigest(dateObj = new Date()) {
   const data = await computePerEmployee(dateObj);
   return buildText(dateObj, data);
 }
 
-/**
- * Build and broadcast the digest to every configured Telegram chat.
- * @returns {Promise<{ok:boolean, skipped?:boolean, chats?:number, sent?:number, failed?:number, counts?:object, error?:string}>}
- */
 async function sendTrackerDigest(dateObj = new Date()) {
   try {
     if (!process.env.TELEGRAM_BOT_TOKEN) {
