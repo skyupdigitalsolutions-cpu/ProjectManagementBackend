@@ -19,6 +19,8 @@ const Notification = require('../models/notification');
 const { cloudinary } = require('../config/cloudinary');
 
 const CHANNEL = 'employees';
+// A sender can delete their own message only within this window after sending.
+const DELETE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 const handleError = (res, error, code = 500) => {
@@ -186,6 +188,13 @@ const deleteMessage = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Message not found' });
     if (msg.sender_id.toString() !== req.user._id.toString())
       return res.status(403).json({ success: false, message: 'You can only delete your own messages' });
+
+    // Time gate: deletion is allowed only within 15 minutes of sending.
+    if (Date.now() - new Date(msg.createdAt).getTime() > DELETE_WINDOW_MS)
+      return res.status(403).json({
+        success: false,
+        message: 'This message can no longer be deleted (15-minute limit passed).',
+      });
 
     // Soft delete. Also clears content/attachments/mentions so nothing lingers.
     await Message.updateOne(
