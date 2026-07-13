@@ -4,10 +4,14 @@
  * Mounted in routes/Index.js as:  router.use('/tracker', trackerRoutes);
  * Full paths therefore: /api/tracker/...
  *
- * DAILY LIMIT: the register + heartbeat responses include `daily_limit_sec`,
- * read from the active Policy's `full_day_hours`. The agent enforces the limit
- * locally (wall-clock elapsed since first clock-in today) and signs the user
- * out when it's reached.
+ * STOP ON CLOCK-OUT: the register + heartbeat responses include the caller's
+ * live attendance state — `clocked_in` / `should_track`. The desktop agent
+ * keeps tracking while the employee is clocked in and STOPS the moment they
+ * clock out (attendance record for today gets a `clock_out`). This replaces
+ * the old fixed 8-hour cap.
+ *
+ * `daily_limit_sec` is still sent (from the active Policy's `full_day_hours`)
+ * only as an optional safety ceiling; clock-out is now the primary trigger.
  */
 
 const express = require('express');
@@ -18,6 +22,7 @@ const router = express.Router();
 const User = require('../models/users');
 const Task = require('../models/tasks');
 const Policy = require('../models/policy');
+const Attendance = require('../models/attendance');
 const ActivityLog = require('../models/ActivityLog');
 const AppCategory = require('../models/AppCategory');
 const { classifyBatch } = require('../services/classificationService');
@@ -35,6 +40,42 @@ async function getDailyLimitSec() {
     return Math.round(hours * 3600);
   } catch {
     return 8 * 3600;
+  }
+}
+
+// Returns the caller's live clock state for today.
+// `clocked_in` is true while an attendance record exists for today and has NOT
+// yet been clocked out. The desktop agent uses this to keep tracking while the
+// employee is clocked in and to STOP the instant they clock out.
+// Works for both manual/WFH clock-ins and eSSL biometric punches, since both
+// write the same Attendance record (clock_out stays null until they punch out).
+async function getClockState(userId) {
+  try {
+    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const record = await Attendance.findOne({
+      user_id: userId,
+      date: { $gte: dayStart, $lt: dayEnd },
+    })
+      .select('clock_in clock_out')
+      .sort({ clock_in: -1 })
+      .lean();
+
+    if (!record) {
+      // No attendance record yet today — not clocked in.
+      return { has_record: false, clocked_in: false, clock_in: null, clock_out: null };
+    }
+    return {
+      has_record: true,
+      clocked_in: record.clock_out == null,
+      clock_in: record.clock_in || null,
+      clock_out: record.clock_out || null,
+    };
+  } catch {
+    // Fail OPEN on a transient DB error so a hiccup never silently kills an
+    // employee's tracking mid-day; the next heartbeat re-checks and corrects.
+    return { has_record: true, clocked_in: true, clock_in: null, clock_out: null };
   }
 }
 
@@ -91,6 +132,7 @@ router.post('/device/register', async (req, res) => {
     );
 
     const daily_limit_sec = await getDailyLimitSec();
+    const clock = await getClockState(user._id);
 
     res.status(201).json({
       success: true,
@@ -98,6 +140,10 @@ router.post('/device/register', async (req, res) => {
       user_name: user.name,
       device_id: device._id,
       daily_limit_sec,
+      clocked_in: clock.clocked_in,
+      should_track: clock.clocked_in,
+      clock_in: clock.clock_in,
+      clock_out: clock.clock_out,
     });
   } catch (err) {
     console.error('Tracker device register error:', err);
@@ -142,13 +188,22 @@ router.post('/activity/bulk', trackerAuth, async (req, res) => {
 });
 
 // ─── POST /api/tracker/heartbeat ──────────────────────────────────────────────
-// Returns the current daily limit so the agent always has the latest policy value.
+// Returns the caller's live clock state so the agent stops tracking the moment
+// the employee clocks out. `daily_limit_sec` is still sent as an optional cap.
 router.post('/heartbeat', trackerAuth, async (req, res) => {
   req.trackerDevice.last_seen = new Date();
   req.trackerDevice.is_tracking = Boolean(req.body.tracking);
   await req.trackerDevice.save();
   const daily_limit_sec = await getDailyLimitSec();
-  res.json({ success: true, daily_limit_sec });
+  const clock = await getClockState(req.trackerUser);
+  res.json({
+    success: true,
+    daily_limit_sec,
+    clocked_in: clock.clocked_in,
+    should_track: clock.clocked_in,
+    clock_in: clock.clock_in,
+    clock_out: clock.clock_out,
+  });
 });
 
 // ─── GET /api/tracker/tasks/mine ──────────────────────────────────────────────
