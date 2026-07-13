@@ -10,10 +10,14 @@
  *
  * Destinations
  *   Set TELEGRAM_DAILY_REPORT_CHAT_IDS to a comma-separated list of chat ids
- *   (group/supergroup ids are negative, e.g. -1004364279119). There is NO
+ *   (group/supergroup ids are negative, e.g. -1004395403759). There is NO
  *   fallback to TELEGRAM_CHAT_ID here — that keeps daily reports from ever
- *   leaking into the attendance/tracker group by accident. TELEGRAM_BOT_TOKEN
- *   is still required.
+ *   leaking into the attendance/tracker group by accident.
+ *
+ * Bot
+ *   Uses a DEDICATED bot when TELEGRAM_DAILY_REPORT_BOT_TOKEN is set, so daily
+ *   reports can be sent by a different bot than the tracker/attendance ones.
+ *   Falls back to TELEGRAM_BOT_TOKEN when the dedicated token isn't set.
  *
  * Never throws — a Telegram/DB failure here must not crash a cron run.
  */
@@ -32,6 +36,11 @@ const MOOD_EMOJI = { great: '😄', good: '🙂', okay: '😐', struggling: '�
 function getChatIds() {
   const raw = process.env.TELEGRAM_DAILY_REPORT_CHAT_IDS || '';
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// Dedicated bot for daily reports if configured, else the shared default bot.
+function getBotToken() {
+  return process.env.TELEGRAM_DAILY_REPORT_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
 }
 
 // ─── Formatting ─────────────────────────────────────────────────────────────
@@ -122,8 +131,9 @@ async function buildDailyReportDigest(dateObj = new Date()) {
 
 async function sendDailyReportDigest(dateObj = new Date()) {
   try {
-    if (!process.env.TELEGRAM_BOT_TOKEN) {
-      return { ok: false, skipped: true, error: 'TELEGRAM_BOT_TOKEN not set' };
+    const botToken = getBotToken();
+    if (!botToken) {
+      return { ok: false, skipped: true, error: 'No bot token set (TELEGRAM_DAILY_REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN)' };
     }
     const chatIds = getChatIds();
     if (!chatIds.length) {
@@ -137,7 +147,7 @@ async function sendDailyReportDigest(dateObj = new Date()) {
     let failed = 0;
     for (const chatId of chatIds) {
       for (const part of parts) {
-        const r = await sendTelegramMessage(part, { chatId });
+        const r = await sendTelegramMessage(part, { chatId, botToken });
         if (r.ok) sent += 1; else failed += 1;
       }
     }

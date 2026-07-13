@@ -47,6 +47,8 @@ function escapeHtml(str = "") {
  * @param {string} text                      Message text (HTML by default).
  * @param {Object} [opts]
  * @param {string} [opts.chatId]             Override the default chat id.
+ * @param {string} [opts.botToken]           Override the default bot token (use
+ *                                            a dedicated bot for this message).
  * @param {string} [opts.parseMode='HTML']   'HTML' | 'MarkdownV2' | '' (plain).
  * @param {boolean}[opts.disablePreview=true]
  * @returns {Promise<{ok:boolean, skipped?:boolean, error?:string, data?:object}>}
@@ -54,14 +56,17 @@ function escapeHtml(str = "") {
 async function sendTelegramMessage(text, opts = {}) {
   const {
     chatId,
+    botToken,
     parseMode = "HTML",
     disablePreview = true,
   } = opts;
 
   try {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
+    // Allow a per-message bot override (e.g. a dedicated daily-report bot);
+    // falls back to the default TELEGRAM_BOT_TOKEN when not provided.
+    const token = botToken || process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
-      console.warn("[telegram] TELEGRAM_BOT_TOKEN not set — message skipped");
+      console.warn("[telegram] bot token not set — message skipped");
       return { ok: false, skipped: true };
     }
 
