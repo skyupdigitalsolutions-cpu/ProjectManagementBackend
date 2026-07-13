@@ -27,6 +27,7 @@ const { annotateLockState, stampUnlocks, durationDays } = require('./phaseGate')
 const { notifyAdmins } = require('./notify');
 const { sendDailyAttendanceDigest } = require('./attendanceAlerts');
 const { sendTrackerDigest } = require('./trackerDigest');
+const { sendDailyReportDigest } = require('./dailyReportDigest');
 const log = require('./assignmentLogger');
 
 // ─── Brevo client factory (mirrors emailController.js pattern) ────────────────
@@ -370,6 +371,21 @@ async function runTrackerDigestJob() {
   }
 }
 
+async function runDailyReportDigestJob() {
+  try {
+    const result = await sendDailyReportDigest(new Date());
+    if (result.skipped) {
+      console.log('[CRON] Daily report digest skipped:', result.error);
+    } else if (result.ok) {
+      console.log('[CRON] Daily report digest sent', { chats: result.chats, sent: result.sent, failed: result.failed });
+    } else {
+      console.warn('[CRON] Daily report digest failed:', result.error);
+    }
+  } catch (err) {
+    console.error('[CRON] Daily report digest job failed:', err.message);
+  }
+}
+
 function initCronJobs() {
   // 9 AM daily
   cron.schedule('0 9 * * *', async () => {
@@ -410,7 +426,16 @@ function initCronJobs() {
     runTrackerDigestJob();
   });
 
-  console.log(`[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance | attendance digest (${digestCron}) | tracker digest (${trackerDigestCron})`);
+  // Daily report digest to Telegram — sent to TELEGRAM_DAILY_REPORT_CHAT_IDS
+  // (its own group). Default: 14:30 UTC = 20:00 IST. Override with
+  // DAILY_REPORT_DIGEST_CRON.
+  const dailyReportCron = process.env.DAILY_REPORT_DIGEST_CRON || '30 14 * * *';
+  cron.schedule(dailyReportCron, () => {
+    console.log('[CRON] Daily report digest job starting at', new Date().toISOString());
+    runDailyReportDigestJob();
+  });
+
+  console.log(`[CRON] Jobs initialized: 9AM daily | midnight overdue | every-6h rebalance | attendance digest (${digestCron}) | tracker digest (${trackerDigestCron}) | daily report digest (${dailyReportCron})`);
 }
 
 module.exports = {
@@ -422,4 +447,5 @@ module.exports = {
   runRebalanceJob,
   runAttendanceDigestJob,
   runTrackerDigestJob,
+  runDailyReportDigestJob,
 };
