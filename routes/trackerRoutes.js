@@ -1,18 +1,4 @@
-/**
- * routes/trackerRoutes.js — Desktop tracker (SkyUp Tracker agent) endpoints
- *
- * Mounted in routes/Index.js as:  router.use('/tracker', trackerRoutes);
- * Full paths therefore: /api/tracker/...
- *
- * STOP ON CLOCK-OUT: the register + heartbeat responses include the caller's
- * live attendance state — `clocked_in` / `should_track`. The desktop agent
- * keeps tracking while the employee is clocked in and STOPS the moment they
- * clock out (attendance record for today gets a `clock_out`). This replaces
- * the old fixed 8-hour cap.
- *
- * `daily_limit_sec` is still sent (from the active Policy's `full_day_hours`)
- * only as an optional safety ceiling; clock-out is now the primary trigger.
- */
+
 
 const express = require('express');
 const jwt = require('jsonwebtoken');

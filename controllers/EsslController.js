@@ -4,8 +4,16 @@
  * Handles all eSSL / ZKTeco fingerprint machine integration.
  *
  * eSSL F22 NOTE: this device sends EVERY punch as type "check-in" (it does not
- * distinguish in vs out). So clock_in/clock_out are derived by ORDER, not type:
- *   first punch of the day = clock_in, last punch = clock_out.
+ * distinguish in vs out). Attendance follows a STRICT TWO-PUNCH model:
+ *   1st distinct punch of the day → clock_in   (morning)
+ *   2nd distinct punch of the day → clock_out  (evening — stops the tracker)
+ *   3rd+ punches                  → ignored for clock_in/clock_out
+ * "Distinct" matters: the F22 frequently registers one finger-placement as two
+ * records seconds/minutes apart (re-taps, device re-sends). Punches inside a
+ * short burst window (ESSL_PUNCH_MERGE_WINDOW_MIN, default 10 min) are merged
+ * into ONE punch so a morning re-tap can never be mistaken for the evening
+ * clock-out. There is NO time-based cap anywhere: until the second distinct
+ * punch lands, clock_out stays null and the desktop tracker keeps running.
  *
  * HOW fingerprint_id MAPS TO employees:
  *   Each employee must have their fingerprint_id set in the User document.
@@ -23,6 +31,12 @@ const toMidnight = (date = new Date()) => {
   d.setHours(0, 0, 0, 0);
   return d;
 };
+
+// Punches closer together than this are treated as ONE punch (device re-sends,
+// employee re-taps because it didn't beep, etc.). 10 minutes is far below any
+// real in→out gap but comfortably above re-tap noise. Override via env.
+const PUNCH_MERGE_WINDOW_MIN = Number(process.env.ESSL_PUNCH_MERGE_WINDOW_MIN || 10);
+const PUNCH_MERGE_WINDOW_MS = Math.max(0, PUNCH_MERGE_WINDOW_MIN) * 60 * 1000;
 
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
@@ -61,10 +75,15 @@ const decodeVerifyMethod = (verifyCode) => {
  * clock_in / clock_out.
  *
  * The eSSL F22 sends every punch as "check-in", so we DON'T trust the type.
- * Instead we order all punches by time:
- *   first punch  → clock_in
- *   last  punch  → clock_out   (2nd/4th/… punches are outs; last one wins)
- * A single punch = clocked in but not out yet (clock_out stays null).
+ * We order all punches by time, MERGE bursts (punches within
+ * PUNCH_MERGE_WINDOW_MS of the previous kept punch count as the same physical
+ * punch), then apply the strict two-punch model:
+ *   1st distinct punch → clock_in
+ *   2nd distinct punch → clock_out  (the tracker stops here, whenever it is —
+ *                                    there is no 8-hour or time-based cap)
+ *   3rd+ punches       → ignored (kept in raw_logs for audit only)
+ * One distinct punch = clocked in but not out yet (clock_out stays null, the
+ * desktop tracker keeps running no matter how long the day gets).
  */
 const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial) => {
   const userId = user._id;
@@ -103,15 +122,28 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   allPunches.sort((a, b) => a.time - b.time);
   if (!allPunches.length) return null;
 
-  // 5. Derive clock_in / clock_out by ORDER (first = in, last = out).
-  const clock_in = new Date(allPunches[0].time);
-  const clock_out =
-    allPunches.length > 1 ? new Date(allPunches[allPunches.length - 1].time) : null;
+  // 5. Merge punch BURSTS: any punch within PUNCH_MERGE_WINDOW_MS of the last
+  //    kept punch is the same physical punch (re-tap / device re-send), not a
+  //    new event. This is what previously turned a morning re-tap into a fake
+  //    clock-out and stopped the tracker minutes after clock-in.
+  const distinct = [];
+  for (const p of allPunches) {
+    const last = distinct[distinct.length - 1];
+    if (last && p.time - last.time < PUNCH_MERGE_WINDOW_MS) continue;
+    distinct.push(p);
+  }
+
+  // 6. Strict two-punch derivation:
+  //    1st distinct punch → clock_in, 2nd → clock_out, anything after → ignored.
+  //    No time-based cap: with only one distinct punch, clock_out stays null
+  //    and the desktop tracker keeps running until the evening punch lands.
+  const clock_in = new Date(distinct[0].time);
+  const clock_out = distinct.length >= 2 ? new Date(distinct[1].time) : null;
 
   const hours_worked = clock_out ? calcHours(clock_in, clock_out) : null;
   const status = deriveStatus(clock_in, clock_out);
 
-  // 6. Save the full deduped set with $set (NOT $push — avoids duplicate pile-up).
+  // 7. Save the full deduped set with $set (NOT $push — avoids duplicate pile-up).
   const record = await Attendance.findOneAndUpdate(
     { user_id: userId, date },
     {
