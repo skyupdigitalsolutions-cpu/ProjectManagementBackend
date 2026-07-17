@@ -4,16 +4,34 @@
  * Handles all eSSL / ZKTeco fingerprint machine integration.
  *
  * eSSL F22 NOTE: this device sends EVERY punch as type "check-in" (it does not
- * distinguish in vs out). Attendance follows a STRICT TWO-PUNCH model:
- *   1st distinct punch of the day → clock_in   (morning)
- *   2nd distinct punch of the day → clock_out  (evening — stops the tracker)
- *   3rd+ punches                  → ignored for clock_in/clock_out
- * "Distinct" matters: the F22 frequently registers one finger-placement as two
- * records seconds/minutes apart (re-taps, device re-sends). Punches inside a
+ * distinguish in vs out). We therefore DON'T trust the punch type. We order all
+ * distinct punches for the day and treat them as IN/OUT PAIRS:
+ *   punch 1 → clock_in   (morning)
+ *   punch 2 → out of a segment  (e.g. lunch-out)
+ *   punch 3 → in of the next segment (e.g. lunch-in)
+ *   ...
+ *   last punch of the day → clock_out  ── ONLY when it qualifies as end-of-day.
+ *
+ * WHY THE MODEL CHANGED (the tracker "showed 4h for 7h worked" bug):
+ *   The previous STRICT TWO-PUNCH model made the 2ND distinct punch the
+ *   clock_out. For anyone who biometric-punches for lunch, that 2nd punch is the
+ *   LUNCH-OUT (~1pm). The heartbeat then reported "clocked out", the desktop
+ *   tracker stopped at lunch, and the whole afternoon went untracked.
+ *   Now a mid-day punch NEVER sets clock_out: only a punch that is clearly
+ *   end-of-day does (see isEndOfDayPunch below). Lunch simply becomes a break.
+ *
+ * "Distinct" still matters: the F22 frequently registers one finger-placement as
+ * two records seconds/minutes apart (re-taps, device re-sends). Punches inside a
  * short burst window (ESSL_PUNCH_MERGE_WINDOW_MIN, default 10 min) are merged
- * into ONE punch so a morning re-tap can never be mistaken for the evening
- * clock-out. There is NO time-based cap anywhere: until the second distinct
- * punch lands, clock_out stays null and the desktop tracker keeps running.
+ * into ONE punch.
+ *
+ * END-OF-DAY DETECTION (config via env):
+ *   A trailing "out" punch is treated as the real clock_out when EITHER:
+ *     (a) it happened at/after ESSL_EOD_AFTER_HOUR:ESSL_EOD_AFTER_MIN (IST),
+ *         default 16:00 — so a ~1-2pm lunch-out never qualifies; OR
+ *     (b) it has been "settled" for ESSL_CLOCKOUT_SETTLE_MIN minutes with no
+ *         newer punch (default 120) — covers early leavers / half-days.
+ *   Until a punch qualifies, clock_out stays null and the tracker keeps running.
  *
  * HOW fingerprint_id MAPS TO employees:
  *   Each employee must have their fingerprint_id set in the User document.
@@ -38,18 +56,39 @@ const toMidnight = (date = new Date()) => {
 const PUNCH_MERGE_WINDOW_MIN = Number(process.env.ESSL_PUNCH_MERGE_WINDOW_MIN || 10);
 const PUNCH_MERGE_WINDOW_MS = Math.max(0, PUNCH_MERGE_WINDOW_MIN) * 60 * 1000;
 
+// Earliest local (IST) time a punch-out can count as the end-of-day clock_out.
+const EOD_AFTER_HOUR = Number(process.env.ESSL_EOD_AFTER_HOUR || 16); // 4pm
+const EOD_AFTER_MIN = Number(process.env.ESSL_EOD_AFTER_MIN || 0);
+// If the last punch is older than this (no newer punch since), treat it as a
+// finished day even if it's before the EOD hour (early leaver / half-day).
+// Default 120 min — comfortably longer than any normal lunch, so a mid-day
+// lunch-out never gets mistaken for the day's clock-out while the person is away.
+const CLOCKOUT_SETTLE_MS = Math.max(0, Number(process.env.ESSL_CLOCKOUT_SETTLE_MIN || 120)) * 60 * 1000;
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+// Minutes-since-midnight in IST for a UTC instant.
+const istMinutes = (date) => {
+  const shifted = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+  return shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
+};
+
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
 
-const deriveStatus = (clockIn, clockOut = null) => {
-  const totalMinutes =
-    new Date(clockIn).getHours() * 60 + new Date(clockIn).getMinutes();
-  if (clockOut) {
-    const worked = calcHours(new Date(clockIn), new Date(clockOut));
-    if (worked < 4) return "half-day";
-  }
-  if (totalMinutes > 9 * 60 + 15) return "late";
+// Half-day if worked < 4h; late if the first punch is after 09:15 IST.
+const deriveStatus = (clockIn, workedHours = null) => {
+  if (workedHours != null && workedHours < 4) return "half-day";
+  if (istMinutes(clockIn) > 9 * 60 + 15) return "late";
   return "present";
+};
+
+// Would this trailing punch, given the current time, count as end-of-day?
+const isEndOfDayPunch = (punchTime, now = new Date()) => {
+  const mins = istMinutes(punchTime);
+  const afterEodHour = mins >= EOD_AFTER_HOUR * 60 + EOD_AFTER_MIN;
+  const settled = now - new Date(punchTime).getTime() >= CLOCKOUT_SETTLE_MS;
+  return afterEodHour || settled;
 };
 
 const decodePunchType = (typeCode) => {
@@ -69,21 +108,44 @@ const decodeVerifyMethod = (verifyCode) => {
   return map[String(verifyCode)] || "fingerprint";
 };
 
+// Given the ordered distinct punches, roll them up into work segments and derive
+// clock_in / clock_out / worked / break totals.
+//   segments = [[in,out],[in,out],...]; a trailing lone punch = open segment.
+//   clock_out is only set when the LAST punch is (a) an "out" (even count) AND
+//   (b) qualifies as end-of-day. Otherwise the person is still on the clock
+//   (working or on a break) and clock_out stays null.
+const deriveFromDistinct = (distinct, now = new Date()) => {
+  const clock_in = new Date(distinct[0].time);
+  const even = distinct.length % 2 === 0;
+  const lastPunch = distinct[distinct.length - 1].time;
+
+  let clock_out = null;
+  if (distinct.length >= 2 && even && isEndOfDayPunch(lastPunch, now)) {
+    clock_out = new Date(lastPunch);
+  }
+
+  // Sum completed work segments and the gaps between them (breaks).
+  // Only count pairs up to the finalized clock_out; if still on the clock, the
+  // last (open) punch is left out of worked/breaks.
+  const usable = clock_out ? distinct.length : distinct.length - (even ? 0 : 1);
+  let workedMs = 0;
+  let breakMs = 0;
+  for (let i = 0; i + 1 < usable; i += 2) {
+    workedMs += distinct[i + 1].time - distinct[i].time;
+    if (i + 2 < usable) breakMs += distinct[i + 2].time - distinct[i + 1].time;
+  }
+
+  const hours_worked = clock_out ? Math.round((workedMs / 3600000) * 100) / 100 : null;
+  const break_minutes = Math.round(breakMs / 60000);
+  const status = deriveStatus(clock_in, hours_worked);
+
+  return { clock_in, clock_out, hours_worked, break_minutes, status };
+};
+
 /**
  * Core function: given new punch events for one employee on one day, merge them
  * with any punches already stored for that day, de-duplicate, and recompute
- * clock_in / clock_out.
- *
- * The eSSL F22 sends every punch as "check-in", so we DON'T trust the type.
- * We order all punches by time, MERGE bursts (punches within
- * PUNCH_MERGE_WINDOW_MS of the previous kept punch count as the same physical
- * punch), then apply the strict two-punch model:
- *   1st distinct punch → clock_in
- *   2nd distinct punch → clock_out  (the tracker stops here, whenever it is —
- *                                    there is no 8-hour or time-based cap)
- *   3rd+ punches       → ignored (kept in raw_logs for audit only)
- * One distinct punch = clocked in but not out yet (clock_out stays null, the
- * desktop tracker keeps running no matter how long the day gets).
+ * clock_in / clock_out using the pairs + end-of-day model described up top.
  */
 const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial) => {
   const userId = user._id;
@@ -124,8 +186,7 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
 
   // 5. Merge punch BURSTS: any punch within PUNCH_MERGE_WINDOW_MS of the last
   //    kept punch is the same physical punch (re-tap / device re-send), not a
-  //    new event. This is what previously turned a morning re-tap into a fake
-  //    clock-out and stopped the tracker minutes after clock-in.
+  //    new event.
   const distinct = [];
   for (const p of allPunches) {
     const last = distinct[distinct.length - 1];
@@ -133,15 +194,9 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
     distinct.push(p);
   }
 
-  // 6. Strict two-punch derivation:
-  //    1st distinct punch → clock_in, 2nd → clock_out, anything after → ignored.
-  //    No time-based cap: with only one distinct punch, clock_out stays null
-  //    and the desktop tracker keeps running until the evening punch lands.
-  const clock_in = new Date(distinct[0].time);
-  const clock_out = distinct.length >= 2 ? new Date(distinct[1].time) : null;
-
-  const hours_worked = clock_out ? calcHours(clock_in, clock_out) : null;
-  const status = deriveStatus(clock_in, clock_out);
+  // 6. Pairs + end-of-day derivation (lunch pairs never set clock_out).
+  const { clock_in, clock_out, hours_worked, break_minutes, status } =
+    deriveFromDistinct(distinct, new Date());
 
   // 7. Save the full deduped set with $set (NOT $push — avoids duplicate pile-up).
   const record = await Attendance.findOneAndUpdate(
@@ -151,6 +206,7 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
         clock_in,
         clock_out,
         hours_worked,
+        break_minutes,
         status,
         source: "fingerprint",
         device_serial: deviceSerial || null,
@@ -165,7 +221,8 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   if (!existing) {
     handleClockInAlert(record, user).catch(() => {});
   }
-  // Overtime alert: only when a clock-out was just derived (wasn't set before).
+  // Overtime/clock-out alert: only when a real end-of-day clock-out was just
+  // derived (wasn't set before). Lunch punches don't reach here anymore.
   if (record.clock_out && !existing?.clock_out) {
     handleClockOutAlert(record, user).catch(() => {});
   }
