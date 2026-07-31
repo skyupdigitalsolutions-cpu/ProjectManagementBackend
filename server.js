@@ -27,6 +27,31 @@ const {
 
 const app = express();
 
+// ─── Path normalisation (MUST be the very first middleware) ───────────────────
+// eSSL / ZKTeco firmware appends its hardcoded "/iclock/..." path to whatever is
+// typed into the device's "Server Address" field. If that field ends in a "/",
+// the device emits "//iclock/cdata.aspx". Express does NOT collapse duplicate
+// slashes, so "//iclock/cdata.aspx" never matches the "/iclock/cdata.aspx"
+// route and falls through to the 404 handler — the device retries forever and
+// no attendance data is ever ingested.
+//
+// Technicians re-enter that field on site and firmware builds differ, so we
+// normalise here instead of trusting the device config to stay correct.
+// Only the PATH is touched; the query string is preserved byte-for-byte so
+// values that legitimately contain "//" (URLs in params) are never mangled.
+app.use((req, res, next) => {
+  const qIndex = req.url.indexOf('?');
+  const pathname = qIndex === -1 ? req.url : req.url.slice(0, qIndex);
+  const query = qIndex === -1 ? '' : req.url.slice(qIndex);
+
+  const normalised = pathname.replace(/\/{2,}/g, '/');
+  if (normalised !== pathname) {
+    console.log(`[path-fix] ${pathname} → ${normalised}`);
+    req.url = normalised + query;
+  }
+  next();
+});
+
 // ─── CORS (explicit, proxy-proof) ─────────────────────────────────────────────
 // Registered FIRST so the OPTIONS preflight is answered before helmet / routes
 // ever run. Reflects the request Origin when it's on the allow-list, echoes the
