@@ -63,6 +63,54 @@ const evaluateManualClock = async (user) => {
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
 
+// ─── Admin clock-time parsing (IST) ─────────────────────────────────────────
+// The admin edit modal uses <input type="time">, which yields a bare wall-clock
+// string like "10:01". Mongoose cannot cast that to a Date ("Cast to date failed
+// for value \"10:01\" ... at path \"clock_in\""), so we resolve it against the
+// record's own calendar day. Full ISO datetimes are accepted unchanged.
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/** True for "10:01", "9:05", "10:01:30" — a time with no date part. */
+const isTimeOnly = (v) =>
+  typeof v === "string" && /^\d{1,2}:\d{2}(:\d{2})?$/.test(v.trim());
+
+/**
+ * Builds a UTC Date for a wall-clock IST time on the IST calendar day of
+ * `baseDate`. Server TZ-independent: works the same on Render (UTC) and locally.
+ */
+const istTimeOnDate = (baseDate, timeStr) => {
+  const [h, m, s = "0"] = timeStr.trim().split(":");
+  const istDay = new Date(new Date(baseDate).getTime() + IST_OFFSET_MS);
+  const utcMs = Date.UTC(
+    istDay.getUTCFullYear(),
+    istDay.getUTCMonth(),
+    istDay.getUTCDate(),
+    Number(h),
+    Number(m),
+    Number(s),
+    0
+  );
+  return new Date(utcMs - IST_OFFSET_MS);
+};
+
+/**
+ * Normalises an admin-supplied clock value.
+ * Returns a Date, `null` for an intentionally cleared field, or the string
+ * "invalid" when the value cannot be interpreted at all.
+ */
+const parseClockValue = (value, baseDate) => {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date) return isNaN(value.getTime()) ? "invalid" : value;
+  if (isTimeOnly(value)) {
+    const [h, m] = value.trim().split(":").map(Number);
+    if (h > 23 || m > 59) return "invalid";
+    return istTimeOnDate(baseDate, value);
+  }
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? "invalid" : d;
+};
+
 /** Total completed-break time, in whole minutes, for a breaks array */
 const sumBreakMinutes = (breaks = []) =>
   Math.round(
@@ -403,29 +451,94 @@ const updateAttendanceRecord = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid attendance record ID" });
     }
 
-    const updates = { ...req.body };
-    delete updates._id;
-    delete updates.user_id;
-    delete updates.date;
+    // Load first: we need the record's own date to resolve bare "HH:mm" values,
+    // and to recompute hours when only one of the two times is being changed.
+    const existing = await Attendance.findById(id);
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Attendance record not found" });
+    }
 
-    // Recalculate hours if both times are provided
-    if (updates.clock_in && updates.clock_out) {
-      updates.hours_worked = calcHours(new Date(updates.clock_in), new Date(updates.clock_out));
+    const body = req.body || {};
+    const updates = {};
+
+    // Explicit whitelist — never let the client touch user_id, date, raw_logs,
+    // source, notification guards, or hours_worked directly.
+    if (body.status !== undefined) {
+      const allowed = ["present", "absent", "late", "half-day", "on-leave"];
+      const status = String(body.status).trim().toLowerCase();
+      if (!allowed.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: `status must be one of: ${allowed.join(", ")}`,
+        });
+      }
+      updates.status = status;
+    }
+
+    // Anchor bare times to the record's own day (fall back to its clock_in).
+    const baseDate = existing.date || existing.clock_in || new Date();
+
+    if (body.clock_in !== undefined) {
+      const parsed = parseClockValue(body.clock_in, baseDate);
+      if (parsed === "invalid") {
+        return res.status(400).json({
+          success: false,
+          message: "clock_in must be a time (HH:mm) or a valid date-time",
+        });
+      }
+      if (parsed === null) {
+        return res.status(400).json({ success: false, message: "clock_in cannot be cleared" });
+      }
+      updates.clock_in = parsed;
+    }
+
+    if (body.clock_out !== undefined) {
+      const parsed = parseClockValue(body.clock_out, baseDate);
+      if (parsed === "invalid") {
+        return res.status(400).json({
+          success: false,
+          message: "clock_out must be a time (HH:mm) or a valid date-time",
+        });
+      }
+      updates.clock_out = parsed; // null clears it (still on shift)
+    }
+
+    if (body.break_minutes !== undefined) {
+      const mins = Number(body.break_minutes);
+      if (!Number.isFinite(mins) || mins < 0) {
+        return res.status(400).json({ success: false, message: "break_minutes must be 0 or more" });
+      }
+      updates.break_minutes = Math.round(mins);
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, message: "No editable fields supplied" });
+    }
+
+    // ── Resolve the final pair, then recompute hours ──────────────────────────
+    const finalIn = updates.clock_in ?? existing.clock_in;
+    let finalOut = "clock_out" in updates ? updates.clock_out : existing.clock_out;
+
+    if (finalIn && finalOut) {
+      // Overnight shift: a clock-out earlier than the clock-in rolls to next day.
+      if (finalOut <= finalIn) {
+        finalOut = new Date(finalOut.getTime() + 24 * 60 * 60 * 1000);
+        updates.clock_out = finalOut;
+      }
+      updates.hours_worked = calcHours(finalIn, finalOut);
+    } else if ("clock_out" in updates && updates.clock_out === null) {
+      updates.hours_worked = null;
     }
 
     const record = await Attendance.findByIdAndUpdate(
       id,
       { $set: updates },
       { new: true, runValidators: true }
-    ).populate("user_id", "name email");
-
-    if (!record) {
-      return res.status(404).json({ success: false, message: "Attendance record not found" });
-    }
+    ).populate("user_id", "name email department designation work_mode attendance_override dailyWorkingHours");
 
     return res.status(200).json({ success: true, data: record });
   } catch (error) {
-    if (error.name === "ValidationError") {
+    if (error.name === "ValidationError" || error.name === "CastError") {
       return res.status(400).json({ success: false, message: error.message });
     }
     return handleError(res, error);

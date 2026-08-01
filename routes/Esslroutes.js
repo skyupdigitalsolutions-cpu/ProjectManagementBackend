@@ -8,6 +8,8 @@ const {
   syncFromDevice,
   assignFingerprintId,
   getFingerprintMap,
+  getDeviceConfig,
+  pingDevice,
 } = require("../controllers/EsslController");
 
 const { protect, authorise } = require("../middleware/authMiddleware");
@@ -22,6 +24,12 @@ router.get("/iclock/getrequest", getRequest);         // Device polling for comm
 router.post("/iclock/cdata", admsReceiver);           // Device pushes attendance logs ← MAIN
 
 // ─── Admin Routes (require authentication) ────────────────────────────────────
+
+// Device IP/port from backend .env — pre-fills the admin sync form
+router.get("/device-config", protect, authorise("admin", "manager"), getDeviceConfig);
+
+// TCP reachability check before attempting a sync
+router.post("/ping", protect, authorise("admin"), pingDevice);
 
 // Manually pull logs from device over TCP/IP
 router.post("/sync", protect, authorise("admin"), syncFromDevice);

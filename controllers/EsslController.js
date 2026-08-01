@@ -482,6 +482,81 @@ const getFingerprintMap = async (req, res) => {
   }
 };
 
+// ─── Device config + reachability ────────────────────────────────────────────
+
+/**
+ * GET /essl/device-config
+ * Returns the device IP/port from the backend .env so the admin UI can
+ * pre-fill the sync form instead of the admin retyping it each time.
+ * Env: DEVICE_IP, DEVICE_PORT (or ESSL_DEVICE_IP / ESSL_DEVICE_PORT).
+ */
+const getDeviceConfig = async (req, res) => {
+  try {
+    const ip = process.env.DEVICE_IP || process.env.ESSL_DEVICE_IP || "";
+    const port = Number(process.env.DEVICE_PORT || process.env.ESSL_DEVICE_PORT || 4370);
+    const serial = process.env.DEVICE_SERIAL || process.env.ESSL_DEVICE_SERIAL || null;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ip,
+        port,
+        device_serial: serial,
+        configured: Boolean(ip),
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/**
+ * POST /essl/ping   { ip, port }
+ * Opens a short TCP connection to the device to confirm it is reachable from
+ * the server. Always 200 — `data.reachable` carries the result so the UI can
+ * show a status pill rather than treating unreachable as a request failure.
+ */
+const pingDevice = async (req, res) => {
+  const net = require("net");
+
+  const ip = req.body?.ip || process.env.DEVICE_IP || process.env.ESSL_DEVICE_IP;
+  const port = Number(req.body?.port || process.env.DEVICE_PORT || 4370);
+  const timeoutMs = Math.max(1000, Number(process.env.ESSL_PING_TIMEOUT_MS || 5000));
+
+  if (!ip) {
+    return res.status(400).json({ success: false, message: "Device IP is required" });
+  }
+
+  const result = await new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finish = (reachable, message) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ reachable, message });
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true, `Device reachable at ${ip}:${port}`));
+    socket.once("timeout", () =>
+      finish(false, `No response from ${ip}:${port} within ${timeoutMs / 1000}s`)
+    );
+    socket.once("error", (err) =>
+      finish(false, `Cannot reach ${ip}:${port} — ${err.code || err.message}`)
+    );
+
+    socket.connect(port, ip);
+  });
+
+  return res.status(200).json({
+    success: true,
+    data: { ip, port, ...result },
+    ...result,
+  });
+};
+
 module.exports = {
   admsHandshake,
   getRequest,
@@ -489,4 +564,6 @@ module.exports = {
   syncFromDevice,
   assignFingerprintId,
   getFingerprintMap,
+  getDeviceConfig,
+  pingDevice,
 };
