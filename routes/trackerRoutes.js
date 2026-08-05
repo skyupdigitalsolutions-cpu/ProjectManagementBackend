@@ -8,9 +8,11 @@ const Task = require('../models/tasks');
 const Policy = require('../models/policy');
 const Attendance = require('../models/attendance');
 const ActivityLog = require('../models/ActivityLog');
+const Screenshot = require('../models/Screenshot');
 const AppCategory = require('../models/AppCategory');
 const { classifyBatch } = require('../services/classificationService');
 const { buildTrackerDigest, sendTrackerDigest } = require('../services/trackerDigest');
+const { cloudinary } = require('../config/cloudinary');
 const TrackerDevice = require('../models/TrackerDevice');
 const { protect, authorise } = require('../middleware/authMiddleware');
 
@@ -261,6 +263,10 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
     const nameMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
     const userRows = Object.values(perUser).map((u) => ({
       ...u,
+      // Total time the tracker was ON = active + idle. This is the number that
+      // should match the employee's hours-at-desk; `tracked` alone is only the
+      // active (input-giving) portion of it.
+      total: u.tracked + u.idle,
       name: nameMap[u.user_id] ? nameMap[u.user_id].name : 'Unknown',
       designation: nameMap[u.user_id] ? nameMap[u.user_id].designation : '',
     }));
@@ -269,9 +275,10 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
       (a, u) => ({
         tracked: a.tracked + u.tracked,
         idle: a.idle + u.idle,
+        total: a.total + u.total,
         productive: a.productive + u.productive,
       }),
-      { tracked: 0, idle: 0, productive: 0 }
+      { tracked: 0, idle: 0, total: 0, productive: 0 }
     );
 
     const activeSince = new Date(Date.now() - 3 * 60 * 1000);
@@ -287,6 +294,7 @@ router.get('/summary', protect, authorise('admin', 'manager'), async (req, res) 
         totals: {
           tracked_sec: totals.tracked,
           idle_sec: totals.idle,
+          total_sec: totals.total, // active + idle = time the tracker was on
           productive_pct: totals.tracked ? Math.round((totals.productive / totals.tracked) * 100) : 0,
           active_now: activeNow,
         },
@@ -451,6 +459,7 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
         last_activity: span.length ? span[0].last : null,
         tracked_sec: tracked,
         idle_sec: idle,
+        total_sec: tracked + idle, // active + idle = time the tracker was on
         productive_sec: productive,
         neutral_sec: neutral,
         unproductive_sec: unproductive,
@@ -463,6 +472,130 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
   } catch (err) {
     console.error('Tracker employee-summary error:', err);
     res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── Screenshots ───────────────────────────────────────────────────────────────
+// The desktop agent captures every screen every 2 minutes while tracking and
+// posts them here. Images live on Cloudinary (folder tracker-screenshots);
+// Mongo keeps the metadata for the admin dashboard gallery.
+
+const SCREENSHOT_RETENTION_DAYS = Number(process.env.SCREENSHOT_RETENTION_DAYS || 30);
+const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // hard cap per image
+
+// Purge screenshots older than the retention window — Cloudinary asset first,
+// then the Mongo row. Runs lazily (at most every 12h) from the upload route so
+// no separate cron is needed; a failed Cloudinary delete leaves the row in
+// place and the next purge retries it.
+let lastShotPurge = 0;
+async function purgeOldScreenshots() {
+  const now = Date.now();
+  if (now - lastShotPurge < 12 * 60 * 60 * 1000) return;
+  lastShotPurge = now;
+  try {
+    const cutoff = new Date(now - SCREENSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    for (let i = 0; i < 20; i++) { // batches of 100, bounded per run
+      const old = await Screenshot.find({ taken_at: { $lt: cutoff } })
+        .select('public_id').limit(100).lean();
+      if (!old.length) break;
+      const publicIds = old.map((o) => o.public_id).filter(Boolean);
+      if (publicIds.length) {
+        try {
+          await cloudinary.api.delete_resources(publicIds, { resource_type: 'image' });
+        } catch (err) {
+          console.error('Screenshot purge: cloudinary delete failed, will retry next run:', err.message);
+          return; // keep Mongo rows so we never orphan Cloudinary assets
+        }
+      }
+      await Screenshot.deleteMany({ _id: { $in: old.map((o) => o._id) } });
+    }
+  } catch (err) {
+    console.error('Screenshot purge failed:', err.message);
+  }
+}
+
+// ─── POST /api/tracker/screenshot ──────────────────────────────────────────────
+// Body: { image: <base64 JPEG>, taken_at, app_name, is_idle, screen }
+// Device-authenticated (same token as activity uploads).
+router.post('/screenshot', trackerAuth, async (req, res) => {
+  try {
+    const { image, taken_at, app_name, is_idle, screen: screenName } = req.body || {};
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ success: false, message: 'image (base64) is required' });
+    }
+    const b64 = image.replace(/^data:image\/\w+;base64,/, '');
+    const buf = Buffer.from(b64, 'base64');
+    if (!buf.length) {
+      return res.status(400).json({ success: false, message: 'Empty image' });
+    }
+    if (buf.length > MAX_SCREENSHOT_BYTES) {
+      return res.status(413).json({ success: false, message: 'Image too large' });
+    }
+
+    const uploaded = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: 'tracker-screenshots', resource_type: 'image', format: 'jpg' },
+        (err, result) => (err ? reject(err) : resolve(result))
+      );
+      stream.end(buf);
+    });
+
+    const doc = await Screenshot.create({
+      user_id: req.trackerUser,
+      device_id: req.trackerDevice._id,
+      taken_at: taken_at ? new Date(taken_at) : new Date(),
+      url: uploaded.secure_url,
+      public_id: uploaded.public_id,
+      screen: String(screenName || '').slice(0, 60),
+      app_name: String(app_name || '').slice(0, 120),
+      is_idle: Boolean(is_idle),
+      width: uploaded.width,
+      height: uploaded.height,
+      bytes: uploaded.bytes,
+    });
+
+    purgeOldScreenshots(); // fire-and-forget housekeeping
+
+    res.status(201).json({ success: true, id: doc._id });
+  } catch (err) {
+    console.error('Tracker screenshot upload error:', err);
+    res.status(500).json({ success: false, message: 'Screenshot upload failed' });
+  }
+});
+
+// ─── GET /api/tracker/screenshots?user_id=&date=YYYY-MM-DD ────────────────────
+// One employee's screenshots for a day, oldest first. thumb_url is a Cloudinary
+// on-the-fly transformation (no extra storage) for the dashboard grid; `url`
+// is the full-resolution image for the lightbox.
+router.get('/screenshots', protect, authorise('admin', 'manager'), async (req, res) => {
+  try {
+    if (!req.query.user_id) {
+      return res.status(400).json({ success: false, message: 'user_id is required' });
+    }
+    const mongoose = require('mongoose');
+    if (!mongoose.Types.ObjectId.isValid(req.query.user_id)) {
+      return res.status(400).json({ success: false, message: 'Invalid user_id' });
+    }
+    const uid = new mongoose.Types.ObjectId(req.query.user_id);
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const shots = await Screenshot.find({ user_id: uid, taken_at: { $gte: dayStart, $lt: dayEnd } })
+      .sort({ taken_at: 1 })
+      .select('taken_at app_name is_idle screen url')
+      .lean();
+
+    const thumb = (url) =>
+      url.includes('/upload/') ? url.replace('/upload/', '/upload/w_400,c_limit,q_auto/') : url;
+
+    res.json({
+      success: true,
+      data: shots.map((s) => ({ ...s, thumb_url: thumb(s.url) })),
+    });
+  } catch (err) {
+    console.error('Tracker screenshots list error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load screenshots' });
   }
 });
 
