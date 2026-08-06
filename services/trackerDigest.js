@@ -21,6 +21,7 @@
  */
 
 const ActivityLog = require('../models/ActivityLog');
+const IdleReason = require('../models/IdleReason');
 const User = require('../models/users');
 const { classifyBatch } = require('./classificationService');
 const { sendTelegramMessage, escapeHtml } = require('./telegram');
@@ -142,6 +143,18 @@ async function computePerEmployee(dateObj = new Date()) {
     projMap[uid].push({ title: p.project_title || 'Untagged', seconds: p.seconds });
   }
 
+  // Employee-submitted reasons for 4+ min idle stretches (from the tracker prompt)
+  const reasonRows = await IdleReason.find({ idle_start: { $gte: dayStart, $lt: dayEnd } })
+    .sort({ idle_start: 1 })
+    .select('user_id idle_start idle_end duration_sec reason')
+    .lean();
+  const reasonMap = {}; // uid -> [{idle_start, idle_end, duration_sec, reason}]
+  for (const r of reasonRows) {
+    const uid = String(r.user_id);
+    if (!reasonMap[uid]) reasonMap[uid] = [];
+    reasonMap[uid].push(r);
+  }
+
   const list = Object.values(perUser).map((u) => {
     const uid = u.user_id;
     const topApps = Object.entries(appTotals[uid] || {})
@@ -155,6 +168,7 @@ async function computePerEmployee(dateObj = new Date()) {
       last: spanMap[uid]?.last || null,
       topApps,
       projects: (projMap[uid] || []).slice(0, TOP_PROJECTS),
+      idleReasons: reasonMap[uid] || [],
     };
   }).sort((a, b) => b.tracked - a.tracked);
 
@@ -193,6 +207,19 @@ function buildText(dateObj, data) {
     if (u.projects.length) {
       const projs = u.projects.map((p) => `${escapeHtml(p.title)} ${fmtDuration(p.seconds)}`).join(', ');
       lines.push(`   📁 ${projs}`);
+    }
+    // Idle reasons the employee submitted (4+ min stretches). Cap the lines so
+    // one very idle day can't blow past Telegram's message limit.
+    const IDLE_REASON_LINES = 5;
+    if (u.idleReasons && u.idleReasons.length) {
+      for (const r of u.idleReasons.slice(0, IDLE_REASON_LINES)) {
+        lines.push(
+          `   📝 ${fmtTimeIST(r.idle_start)}–${fmtTimeIST(r.idle_end)} (${fmtDuration(r.duration_sec)}) — ${escapeHtml(String(r.reason).slice(0, 80))}`
+        );
+      }
+      if (u.idleReasons.length > IDLE_REASON_LINES) {
+        lines.push(`   📝 +${u.idleReasons.length - IDLE_REASON_LINES} more idle reasons`);
+      }
     }
   });
 

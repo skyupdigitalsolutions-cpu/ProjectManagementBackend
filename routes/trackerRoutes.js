@@ -9,6 +9,7 @@ const Policy = require('../models/policy');
 const Attendance = require('../models/attendance');
 const ActivityLog = require('../models/ActivityLog');
 const Screenshot = require('../models/Screenshot');
+const IdleReason = require('../models/IdleReason');
 const AppCategory = require('../models/AppCategory');
 const { classifyBatch } = require('../services/classificationService');
 const { buildTrackerDigest, sendTrackerDigest } = require('../services/trackerDigest');
@@ -444,6 +445,12 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
     ]);
     const idle = idleAgg.length ? idleAgg[0].seconds : 0;
 
+    // The employee's stated reasons for each 4+ min idle stretch that day
+    const idleReasons = await IdleReason.find({ user_id: uid, idle_start: { $gte: dayStart, $lt: dayEnd } })
+      .sort({ idle_start: 1 })
+      .select('idle_start idle_end duration_sec reason')
+      .lean();
+
     const projects = projectRows.map((p) => ({
       project_name: p.project_name || 'Untagged',
       seconds: p.seconds,
@@ -460,6 +467,7 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
         tracked_sec: tracked,
         idle_sec: idle,
         total_sec: tracked + idle, // active + idle = time the tracker was on
+        idle_reasons: idleReasons,
         productive_sec: productive,
         neutral_sec: neutral,
         unproductive_sec: unproductive,
@@ -472,6 +480,43 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
   } catch (err) {
     console.error('Tracker employee-summary error:', err);
     res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── POST /api/tracker/idle-reason ─────────────────────────────────────────────
+// The employee's answer to the "why were you idle?" prompt (idle >= 4 min).
+// Body: { reason_id, idle_start, idle_end, duration_sec, reason }
+// Idempotent: reason_id is the tracker entry UUID, so buffered retries after a
+// network failure can never insert the same reason twice.
+router.post('/idle-reason', trackerAuth, async (req, res) => {
+  try {
+    const { reason_id, idle_start, idle_end, duration_sec, reason } = req.body || {};
+    const clean = String(reason || '').trim().slice(0, 300);
+    if (!reason_id || !idle_start || !idle_end || !clean) {
+      return res.status(400).json({ success: false, message: 'reason_id, idle_start, idle_end and reason are required' });
+    }
+
+    try {
+      await IdleReason.create({
+        reason_id: String(reason_id).slice(0, 64),
+        user_id: req.trackerUser,
+        device_id: req.trackerDevice._id,
+        idle_start: new Date(idle_start),
+        idle_end: new Date(idle_end),
+        duration_sec: Math.max(0, Number(duration_sec) || 0),
+        reason: clean,
+      });
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.json({ success: true, duplicate: true }); // retried upload — already stored
+      }
+      throw err;
+    }
+
+    res.status(201).json({ success: true });
+  } catch (err) {
+    console.error('Tracker idle-reason error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save idle reason' });
   }
 });
 
