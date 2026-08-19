@@ -13,18 +13,44 @@ const handleError = (res, error, statusCode = 500) => {
   return res.status(statusCode).json({ success: false, message: error.message || "Internal server error" });
 };
 
-/** Returns a Date at midnight (00:00:00) for the given date */
+// ─── IST constant (used by toMidnight, endOfDay, deriveStatus) ───────────────
+// Defined here (before IST_OFFSET_MS is redeclared below) so the helpers share
+// a single source of truth. The later `const IST_OFFSET_MS` inside the admin
+// clock-time section is removed — both sections now reference this one.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * Returns the UTC Date that corresponds to 00:00:00.000 IST on the IST
+ * calendar day of `date`. Server TZ-independent — works the same on a
+ * Germany-hosted Hetzner box (CET/CEST) as on a UTC Render instance.
+ *
+ * WHY: d.setHours(0,0,0,0) sets midnight in the *server's* local timezone.
+ * On a Hetzner server in Germany (CEST = UTC+2) that's UTC 22:00 the day
+ * before, not UTC 18:30 (IST midnight). Every date-range query in MongoDB
+ * was therefore off, causing punches to appear on the wrong calendar day.
+ */
 const toMidnight = (date = new Date()) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  const ist = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+  return new Date(Date.UTC(
+    ist.getUTCFullYear(),
+    ist.getUTCMonth(),
+    ist.getUTCDate(),
+    0, 0, 0, 0,
+  ) - IST_OFFSET_MS);
 };
 
-/** Returns a Date at the last moment (23:59:59.999) of the given day */
+/**
+ * Returns the UTC Date that corresponds to 23:59:59.999 IST on the IST
+ * calendar day of `date`. Server TZ-independent.
+ */
 const endOfDay = (date = new Date()) => {
-  const d = new Date(date);
-  d.setHours(23, 59, 59, 999);
-  return d;
+  const ist = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+  return new Date(Date.UTC(
+    ist.getUTCFullYear(),
+    ist.getUTCMonth(),
+    ist.getUTCDate(),
+    23, 59, 59, 999,
+  ) - IST_OFFSET_MS);
 };
 
 /**
@@ -68,8 +94,7 @@ const calcHours = (clockIn, clockOut) =>
 // string like "10:01". Mongoose cannot cast that to a Date ("Cast to date failed
 // for value \"10:01\" ... at path \"clock_in\""), so we resolve it against the
 // record's own calendar day. Full ISO datetimes are accepted unchanged.
-
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+// NOTE: IST_OFFSET_MS is declared once at the top of this file.
 
 /** True for "10:01", "9:05", "10:01:30" — a time with no date part. */
 const isTimeOnly = (v) =>
@@ -120,11 +145,15 @@ const sumBreakMinutes = (breaks = []) =>
 /**
  * Derives attendance status from clock-in time.
  * Work start = 09:00. Late threshold = 09:15. Half-day < 4 hours.
+ *
+ * FIX: previously used getHours()/getMinutes() which reads server local time.
+ * On Hetzner (Germany, CEST = UTC+2) that returned the wrong wall-clock hour,
+ * causing IST 09:10 clock-ins to be marked "late" (or vice-versa). We now
+ * always derive the IST hour/minute via UTC math — TZ-independent.
  */
 const deriveStatus = (clockIn, clockOut = null) => {
-  const hour = new Date(clockIn).getHours();
-  const minute = new Date(clockIn).getMinutes();
-  const totalMinutes = hour * 60 + minute;
+  const ist = new Date(new Date(clockIn).getTime() + IST_OFFSET_MS);
+  const totalMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
   if (clockOut) {
     const worked = calcHours(new Date(clockIn), new Date(clockOut));
@@ -616,12 +645,17 @@ const getMonthlySummary = async (req, res) => {
     let from, to;
     if (month) {
       const [y, m] = month.split("-").map(Number);
-      from = new Date(y, m - 1, 1);
-      to = new Date(y, m, 0);         // last day of the month
+      // Use UTC constructor so the date is not shifted by server TZ.
+      // toMidnight() then anchors each to IST midnight correctly.
+      from = new Date(Date.UTC(y, m - 1, 1));
+      to   = new Date(Date.UTC(y, m, 0));     // last day of the month
     } else {
-      const now = new Date();
-      from = new Date(now.getFullYear(), now.getMonth(), 1);
-      to = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      // Derive "today in IST" to get the correct month boundaries.
+      const nowIst = new Date(new Date().getTime() + IST_OFFSET_MS);
+      const y = nowIst.getUTCFullYear();
+      const m = nowIst.getUTCMonth();
+      from = new Date(Date.UTC(y, m, 1));
+      to   = new Date(Date.UTC(y, m + 1, 0));
     }
 
     const records = await Attendance.find({

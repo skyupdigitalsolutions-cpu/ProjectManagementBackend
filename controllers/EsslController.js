@@ -237,8 +237,22 @@ const admsHandshake = async (req, res) => {
     const { SN } = req.query;
     console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)}`);
 
+    // IMPORTANT: The device clock-sync `Date=` field MUST be IST wall-clock time,
+    // because the device is configured with TimeZone=5.5 (IST). Using server-local
+    // time here caused a 30-min offset when the server runs in a non-IST timezone
+    // (e.g. Hetzner Germany = CET/CEST). We always derive IST via UTC math so this
+    // works correctly regardless of the host server's TZ setting.
     const now = new Date();
-    const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+    const ist = new Date(now.getTime() + IST_OFFSET_MS);
+    const timestamp = [
+      ist.getUTCFullYear(),
+      String(ist.getUTCMonth() + 1).padStart(2, "0"),
+      String(ist.getUTCDate()).padStart(2, "0"),
+    ].join("-") + " " + [
+      String(ist.getUTCHours()).padStart(2, "0"),
+      String(ist.getUTCMinutes()).padStart(2, "0"),
+      String(ist.getUTCSeconds()).padStart(2, "0"),
+    ].join(":");
 
     res.set("Content-Type", "text/plain");
     res.send(`GET OPTION FROM: ${SN}\nATTSTAMP\nErrorDelay=30\nDelay=10\nTransTimes=00:00;00:30;01:00;01:30;02:00;02:30;03:00;03:30;04:00;04:30;05:00;05:30;06:00;06:30;07:00;07:30;08:00;08:30;09:00;09:30;10:00;10:30;11:00;11:30;12:00;12:30;13:00;13:30;14:00;14:30;15:00;15:30;16:00;16:30;17:00;17:30;18:00;18:30;19:00;19:30;20:00;20:30;21:00;21:30;22:00;22:30;23:00;23:30\nTransInterval=1\nTransFlag=TransData AttLog OpLog EnrollUser\nTimeZone=5.5\nRealtime=1\nEncrypt=0\nServerVer=2.4\nTableNameFix=0\nDate=${timestamp}\n`);
