@@ -67,6 +67,8 @@ const employeeChatRoutes = require("./employeeChatRoutes");
 // ── Hostinger webmail ─────────────────────────────────────────────────────────
 const mailRoutes = require("./mailroutes");
 
+const productivityRoutes = require("./productivityRoutes");
+
 // ── Mount routes ──────────────────────────────────────────────────────────────
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
@@ -91,5 +93,6 @@ router.use("/tracker", trackerRoutes);
 router.use("/task-templates", taskTemplateRoutes);
 router.use("/employee-chat", employeeChatRoutes);
 router.use("/mail", mailRoutes);
+router.use("/productivity", productivityRoutes);
 
 module.exports = router;

@@ -525,7 +525,7 @@ router.post('/idle-reason', trackerAuth, async (req, res) => {
 // posts them here. Images live on Cloudinary (folder tracker-screenshots);
 // Mongo keeps the metadata for the admin dashboard gallery.
 
-const SCREENSHOT_RETENTION_DAYS = Number(process.env.SCREENSHOT_RETENTION_DAYS || 30);
+const SCREENSHOT_RETENTION_DAYS = Number(process.env.SCREENSHOT_RETENTION_DAYS || 7);
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // hard cap per image
 
 // Purge screenshots older than the retention window — Cloudinary asset first,

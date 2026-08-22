@@ -9,6 +9,12 @@ const mongoose = require('mongoose');
  * SCREENSHOT_RETENTION_DAYS are purged by purgeOldScreenshots() in
  * routes/trackerRoutes.js — deletion must go through Cloudinary too, which is
  * why a plain Mongo TTL index is NOT used here (it would orphan the images).
+ *
+ * VISION FIELDS (category / vision_reason / analyzed_at):
+ *   Filled once by services/screenshotVision.js when the daily productivity
+ *   analyzer scores the day's screenshots. Cached here so each image is sent to
+ *   the vision model at most once — re-running the analyzer is then free.
+ *   `category` is '' until the shot has been analyzed (idle shots stay '').
  */
 const screenshotSchema = new mongoose.Schema(
   {
@@ -23,6 +29,16 @@ const screenshotSchema = new mongoose.Schema(
     width: { type: Number },
     height: { type: Number },
     bytes: { type: Number },
+
+    // ── Cached vision verdict (filled by screenshotVision.js) ─────────────────
+    // '' = not yet analyzed. Idle shots are never analyzed and stay ''.
+    category: {
+      type: String,
+      enum: ['', 'productive', 'neutral', 'unproductive'],
+      default: '',
+    },
+    vision_reason: { type: String, default: '', maxlength: 200 }, // short "why", for auditing
+    analyzed_at: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -32,4 +48,4 @@ screenshotSchema.index({ user_id: 1, taken_at: 1 });
 // Retention purge scan
 screenshotSchema.index({ taken_at: 1 });
 
-module.exports = mongoose.model('Screenshot', screenshotSchema);
+module.exports = mongoose.models.Screenshot || mongoose.model('Screenshot', screenshotSchema);
