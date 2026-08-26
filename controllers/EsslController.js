@@ -67,6 +67,38 @@ const CLOCKOUT_SETTLE_MS = Math.max(0, Number(process.env.ESSL_CLOCKOUT_SETTLE_M
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
+// ─── Device clock-sync policy (fixes the F22 "30-minutes-slow" bug) ──────────
+// Controls whether — and how — the server sets the device clock during the
+// ADMS handshake. The eSSL F22 firmware mishandles a fractional TimeZone (5.5):
+// when it receives Date= together with TimeZone=5.5 it drops the half-hour and
+// the clock ends up exactly 30 minutes slow. Options:
+//   "off" (DEFAULT) → send NEITHER Date= NOR TimeZone=. The device keeps the
+//                     correct local time from its own Time Zone menu (GMT+05:30).
+//                     Safest: nothing on the wire can mangle the half-hour.
+//   "utc"           → send Date= in UTC with TimeZone=0. The device's own menu
+//                     timezone (GMT+05:30) does the display conversion, so the
+//                     server can keep the clock corrected without ever putting a
+//                     fractional timezone on the wire.
+//   "ist"           → legacy: Date= in IST wall-clock + TimeZone=5.5. Only use
+//                     if you've confirmed your firmware handles 5.5 correctly.
+// NOTE: this does NOT affect how punches are parsed — admsReceiver always reads
+// ATTLOG timestamps as IST (+05:30), independent of this setting.
+const TIME_SYNC = String(process.env.ESSL_TIME_SYNC || "off").toLowerCase();
+
+// Format a Date's UTC components as "YYYY-MM-DD HH:MM:SS" (no timezone shift).
+const fmtClock = (d) =>
+  [
+    d.getUTCFullYear(),
+    String(d.getUTCMonth() + 1).padStart(2, "0"),
+    String(d.getUTCDate()).padStart(2, "0"),
+  ].join("-") +
+  " " +
+  [
+    String(d.getUTCHours()).padStart(2, "0"),
+    String(d.getUTCMinutes()).padStart(2, "0"),
+    String(d.getUTCSeconds()).padStart(2, "0"),
+  ].join(":");
+
 // Minutes-since-midnight in IST for a UTC instant.
 const istMinutes = (date) => {
   const shifted = new Date(new Date(date).getTime() + IST_OFFSET_MS);
@@ -235,27 +267,41 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;
-    console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)}`);
+    console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)} | TIME_SYNC=${TIME_SYNC}`);
 
-    // IMPORTANT: The device clock-sync `Date=` field MUST be IST wall-clock time,
-    // because the device is configured with TimeZone=5.5 (IST). Using server-local
-    // time here caused a 30-min offset when the server runs in a non-IST timezone
-    // (e.g. Hetzner Germany = CET/CEST). We always derive IST via UTC math so this
-    // works correctly regardless of the host server's TZ setting.
-    const now = new Date();
-    const ist = new Date(now.getTime() + IST_OFFSET_MS);
-    const timestamp = [
-      ist.getUTCFullYear(),
-      String(ist.getUTCMonth() + 1).padStart(2, "0"),
-      String(ist.getUTCDate()).padStart(2, "0"),
-    ].join("-") + " " + [
-      String(ist.getUTCHours()).padStart(2, "0"),
-      String(ist.getUTCMinutes()).padStart(2, "0"),
-      String(ist.getUTCSeconds()).padStart(2, "0"),
-    ].join(":");
+    // Base options. TransTimes/TransFlag/Realtime tell the device WHAT and WHEN
+    // to push; they don't touch the clock. The clock lines (TimeZone/Date) are
+    // appended conditionally below so the F22 can't mangle the +5:30 half-hour.
+    const options = [
+      `GET OPTION FROM: ${SN}`,
+      "ATTSTAMP",
+      "ErrorDelay=30",
+      "Delay=10",
+      "TransTimes=00:00;00:30;01:00;01:30;02:00;02:30;03:00;03:30;04:00;04:30;05:00;05:30;06:00;06:30;07:00;07:30;08:00;08:30;09:00;09:30;10:00;10:30;11:00;11:30;12:00;12:30;13:00;13:30;14:00;14:30;15:00;15:30;16:00;16:30;17:00;17:30;18:00;18:30;19:00;19:30;20:00;20:30;21:00;21:30;22:00;22:30;23:00;23:30",
+      "TransInterval=1",
+      "TransFlag=TransData AttLog OpLog EnrollUser",
+      "Realtime=1",
+      "Encrypt=0",
+      "ServerVer=2.4",
+      "TableNameFix=0",
+    ];
+
+    if (TIME_SYNC === "utc") {
+      // Give the device UTC + a whole-number timezone (0). The device's own menu
+      // timezone (GMT+05:30) then renders the correct local time. No fractional
+      // timezone ever crosses the wire, so the half-hour can't be dropped.
+      options.push("TimeZone=0");
+      options.push(`Date=${fmtClock(new Date())}`);
+    } else if (TIME_SYNC === "ist") {
+      // Legacy behaviour — only correct on firmware that parses 5.5 properly.
+      options.push("TimeZone=5.5");
+      options.push(`Date=${fmtClock(new Date(Date.now() + IST_OFFSET_MS))}`);
+    }
+    // "off" (default): send neither TimeZone nor Date. The device keeps the
+    // correct local time from its own Time Zone menu and is never overridden.
 
     res.set("Content-Type", "text/plain");
-    res.send(`GET OPTION FROM: ${SN}\nATTSTAMP\nErrorDelay=30\nDelay=10\nTransTimes=00:00;00:30;01:00;01:30;02:00;02:30;03:00;03:30;04:00;04:30;05:00;05:30;06:00;06:30;07:00;07:30;08:00;08:30;09:00;09:30;10:00;10:30;11:00;11:30;12:00;12:30;13:00;13:30;14:00;14:30;15:00;15:30;16:00;16:30;17:00;17:30;18:00;18:30;19:00;19:30;20:00;20:30;21:00;21:30;22:00;22:30;23:00;23:30\nTransInterval=1\nTransFlag=TransData AttLog OpLog EnrollUser\nTimeZone=5.5\nRealtime=1\nEncrypt=0\nServerVer=2.4\nTableNameFix=0\nDate=${timestamp}\n`);
+    res.send(options.join("\n") + "\n");
   } catch (err) {
     console.error("[eSSL] Handshake error:", err);
     res.status(500).send("ERROR");
