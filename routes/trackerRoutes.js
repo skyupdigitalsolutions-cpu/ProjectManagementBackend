@@ -19,6 +19,14 @@ const { protect, authorise } = require('../middleware/authMiddleware');
 
 const TRACKER_JWT_SECRET = process.env.TRACKER_JWT_SECRET || process.env.JWT_SECRET;
 
+// Must match the desktop tracker's IDLE_AFTER_SEC (src capture / main.js).
+// An ActivityLog entry is only LABELLED is_idle after this many seconds without
+// input, so the real idle stretch began IDLE_AFTER_SEC earlier than entry.start
+// and is that much longer than entry.duration_sec. We re-apply the same offset
+// here so idle windows shown/saved from the web app match what the tracker used
+// to compute in its own popup.
+const IDLE_AFTER_SEC = 240;
+
 // Read the daily tracking limit (seconds) from the active company policy.
 // Falls back to 8h if no policy or field is set.
 async function getDailyLimitSec() {
@@ -358,128 +366,259 @@ router.patch('/devices/:id/revoke', protect, authorise('admin'), async (req, res
 // ─── GET /api/tracker/employee-summary?user_id=&date= ─────────────────────────
 // A rolled-up daily summary for ONE employee: totals, first/last activity,
 // top apps (with category), and time per project. Powers the expandable row.
+// Build one employee's day summary (tracked/idle/productive breakdown, top apps,
+// projects and stated idle reasons). Shared by the admin `employee-summary`
+// route and the employee-facing `my/summary` route so both return identical
+// shapes. `uid` may be an ObjectId or a string.
+async function buildDaySummary(uid, date) {
+  const mongoose = require('mongoose');
+  uid = uid instanceof mongoose.Types.ObjectId ? uid : new mongoose.Types.ObjectId(uid);
+  const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
+  const match = { user_id: uid, start: { $gte: dayStart, $lt: dayEnd } };
+
+  const [appRows, projectRows, span] = await Promise.all([
+    // Time per app+title (non-idle), for top-apps list and classification
+    ActivityLog.aggregate([
+      { $match: { ...match, is_idle: false } },
+      { $group: { _id: { app_name: '$app_name', window_title: '$window_title' }, seconds: { $sum: '$duration_sec' } } },
+      { $sort: { seconds: -1 } },
+    ]),
+    // Time per task -> project, for time-accounting
+    ActivityLog.aggregate([
+      { $match: { ...match, is_idle: false, task_id: { $ne: null } } },
+      { $group: { _id: '$task_id', seconds: { $sum: '$duration_sec' } } },
+      { $lookup: { from: 'tasks', localField: '_id', foreignField: '_id', as: 'task' } },
+      { $unwind: { path: '$task', preserveNullAndEmptyArrays: true } },
+      { $lookup: { from: 'projects', localField: 'task.project_id', foreignField: '_id', as: 'project' } },
+      { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: '$project._id',
+          project_name: { $first: '$project.name' },
+          seconds: { $sum: '$seconds' },
+        },
+      },
+      { $sort: { seconds: -1 } },
+    ]),
+    // First and last activity of the day
+    ActivityLog.aggregate([
+      { $match: match },
+      { $group: { _id: null, first: { $min: '$start' }, last: { $max: '$end' } } },
+    ]),
+  ]);
+
+  // Classify each app+title via manual rules + AI cache
+  const { result: catMap, makeSignature } = await classifyBatch(
+    appRows.map((a) => ({ app_name: a._id.app_name, window_title: a._id.window_title }))
+  );
+  const classify = (app, title) => catMap.get(makeSignature(app, title)) || 'neutral';
+
+  // Roll per-app-title rows up to per-app for the Top apps list
+  const appTotals = {};
+  const unproductiveItems = [];
+  let tracked = 0, productive = 0, neutral = 0, unproductive = 0;
+  for (const a of appRows) {
+    const category = classify(a._id.app_name, a._id.window_title);
+    tracked += a.seconds;
+    if (category === 'productive') productive += a.seconds;
+    else if (category === 'unproductive') {
+      unproductive += a.seconds;
+      unproductiveItems.push({
+        app_name: a._id.app_name || 'Unknown',
+        window_title: a._id.window_title || '',
+        seconds: a.seconds,
+      });
+    } else neutral += a.seconds;
+
+    const name = a._id.app_name || 'Unknown';
+    if (!appTotals[name]) appTotals[name] = { app_name: name, seconds: 0, productive: 0, neutral: 0, unproductive: 0 };
+    appTotals[name].seconds += a.seconds;
+    appTotals[name][category] += a.seconds;
+  }
+  unproductiveItems.sort((a, b) => b.seconds - a.seconds);
+  // Each app's shown category = its dominant category
+  const topApps = Object.values(appTotals).map((t) => {
+    const cat = t.productive >= t.neutral && t.productive >= t.unproductive ? 'productive'
+      : t.unproductive >= t.neutral ? 'unproductive' : 'neutral';
+    return { app_name: t.app_name, seconds: t.seconds, category: cat };
+  }).sort((a, b) => b.seconds - a.seconds);
+
+  // Idle total (separate query kept simple)
+  const idleAgg = await ActivityLog.aggregate([
+    { $match: { ...match, is_idle: true } },
+    { $group: { _id: null, seconds: { $sum: '$duration_sec' } } },
+  ]);
+  const idle = idleAgg.length ? idleAgg[0].seconds : 0;
+
+  // The employee's stated reasons for each 4+ min idle stretch that day
+  const idleReasons = await IdleReason.find({ user_id: uid, idle_start: { $gte: dayStart, $lt: dayEnd } })
+    .sort({ idle_start: 1 })
+    .select('idle_start idle_end duration_sec reason')
+    .lean();
+
+  const projects = projectRows.map((p) => ({
+    project_name: p.project_name || 'Untagged',
+    seconds: p.seconds,
+  }));
+  const untaggedSec = tracked - projects.reduce((s, p) => s + p.seconds, 0);
+  if (untaggedSec > 0) projects.push({ project_name: 'No task', seconds: untaggedSec });
+
+  return {
+    date: dayStart.toISOString().slice(0, 10),
+    first_activity: span.length ? span[0].first : null,
+    last_activity: span.length ? span[0].last : null,
+    tracked_sec: tracked,
+    idle_sec: idle,
+    total_sec: tracked + idle, // active + idle = time the tracker was on
+    idle_reasons: idleReasons,
+    productive_sec: productive,
+    neutral_sec: neutral,
+    unproductive_sec: unproductive,
+    productive_pct: tracked ? Math.round((productive / tracked) * 100) : 0,
+    top_apps: topApps.slice(0, 8),
+    unproductive_items: unproductiveItems.slice(0, 10),
+    projects: projects.sort((a, b) => b.seconds - a.seconds),
+  };
+}
+
 router.get('/employee-summary', protect, authorise('admin', 'manager'), async (req, res) => {
   try {
     if (!req.query.user_id) {
       return res.status(400).json({ success: false, message: 'user_id is required' });
     }
-    const mongoose = require('mongoose');
-    const uid = new mongoose.Types.ObjectId(req.query.user_id);
     const date = req.query.date ? new Date(req.query.date) : new Date();
-    const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
-
-    const match = { user_id: uid, start: { $gte: dayStart, $lt: dayEnd } };
-
-    const [appRows, projectRows, span] = await Promise.all([
-      // Time per app+title (non-idle), for top-apps list and classification
-      ActivityLog.aggregate([
-        { $match: { ...match, is_idle: false } },
-        { $group: { _id: { app_name: '$app_name', window_title: '$window_title' }, seconds: { $sum: '$duration_sec' } } },
-        { $sort: { seconds: -1 } },
-      ]),
-      // Time per task -> project, for time-accounting
-      ActivityLog.aggregate([
-        { $match: { ...match, is_idle: false, task_id: { $ne: null } } },
-        { $group: { _id: '$task_id', seconds: { $sum: '$duration_sec' } } },
-        { $lookup: { from: 'tasks', localField: '_id', foreignField: '_id', as: 'task' } },
-        { $unwind: { path: '$task', preserveNullAndEmptyArrays: true } },
-        { $lookup: { from: 'projects', localField: 'task.project_id', foreignField: '_id', as: 'project' } },
-        { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
-        {
-          $group: {
-            _id: '$project._id',
-            project_name: { $first: '$project.name' },
-            seconds: { $sum: '$seconds' },
-          },
-        },
-        { $sort: { seconds: -1 } },
-      ]),
-      // First and last activity of the day
-      ActivityLog.aggregate([
-        { $match: match },
-        { $group: { _id: null, first: { $min: '$start' }, last: { $max: '$end' } } },
-      ]),
-    ]);
-
-    // Classify each app+title via manual rules + AI cache
-    const { result: catMap, makeSignature } = await classifyBatch(
-      appRows.map((a) => ({ app_name: a._id.app_name, window_title: a._id.window_title }))
-    );
-    const classify = (app, title) => catMap.get(makeSignature(app, title)) || 'neutral';
-
-    // Roll per-app-title rows up to per-app for the Top apps list
-    const appTotals = {};
-    const unproductiveItems = [];
-    let tracked = 0, productive = 0, neutral = 0, unproductive = 0;
-    for (const a of appRows) {
-      const category = classify(a._id.app_name, a._id.window_title);
-      tracked += a.seconds;
-      if (category === 'productive') productive += a.seconds;
-      else if (category === 'unproductive') {
-        unproductive += a.seconds;
-        unproductiveItems.push({
-          app_name: a._id.app_name || 'Unknown',
-          window_title: a._id.window_title || '',
-          seconds: a.seconds,
-        });
-      } else neutral += a.seconds;
-
-      const name = a._id.app_name || 'Unknown';
-      if (!appTotals[name]) appTotals[name] = { app_name: name, seconds: 0, productive: 0, neutral: 0, unproductive: 0 };
-      appTotals[name].seconds += a.seconds;
-      appTotals[name][category] += a.seconds;
-    }
-    unproductiveItems.sort((a, b) => b.seconds - a.seconds);
-    // Each app's shown category = its dominant category
-    const topApps = Object.values(appTotals).map((t) => {
-      const cat = t.productive >= t.neutral && t.productive >= t.unproductive ? 'productive'
-        : t.unproductive >= t.neutral ? 'unproductive' : 'neutral';
-      return { app_name: t.app_name, seconds: t.seconds, category: cat };
-    }).sort((a, b) => b.seconds - a.seconds);
-
-    // Idle total (separate query kept simple)
-    const idleAgg = await ActivityLog.aggregate([
-      { $match: { ...match, is_idle: true } },
-      { $group: { _id: null, seconds: { $sum: '$duration_sec' } } },
-    ]);
-    const idle = idleAgg.length ? idleAgg[0].seconds : 0;
-
-    // The employee's stated reasons for each 4+ min idle stretch that day
-    const idleReasons = await IdleReason.find({ user_id: uid, idle_start: { $gte: dayStart, $lt: dayEnd } })
-      .sort({ idle_start: 1 })
-      .select('idle_start idle_end duration_sec reason')
-      .lean();
-
-    const projects = projectRows.map((p) => ({
-      project_name: p.project_name || 'Untagged',
-      seconds: p.seconds,
-    }));
-    const untaggedSec = tracked - projects.reduce((s, p) => s + p.seconds, 0);
-    if (untaggedSec > 0) projects.push({ project_name: 'No task', seconds: untaggedSec });
-
-    res.json({
-      success: true,
-      data: {
-        date: dayStart.toISOString().slice(0, 10),
-        first_activity: span.length ? span[0].first : null,
-        last_activity: span.length ? span[0].last : null,
-        tracked_sec: tracked,
-        idle_sec: idle,
-        total_sec: tracked + idle, // active + idle = time the tracker was on
-        idle_reasons: idleReasons,
-        productive_sec: productive,
-        neutral_sec: neutral,
-        unproductive_sec: unproductive,
-        productive_pct: tracked ? Math.round((productive / tracked) * 100) : 0,
-        top_apps: topApps.slice(0, 8),
-        unproductive_items: unproductiveItems.slice(0, 10),
-        projects: projects.sort((a, b) => b.seconds - a.seconds),
-      },
-    });
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+    const data = await buildDaySummary(req.query.user_id, date);
+    res.json({ success: true, data });
   } catch (err) {
     console.error('Tracker employee-summary error:', err);
     res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── GET /api/tracker/my/summary?date=YYYY-MM-DD ──────────────────────────────
+// The logged-in employee's OWN day summary — same shape as employee-summary but
+// self-scoped, so any authenticated user can view their own productivity from
+// the web app without admin/manager rights.
+router.get('/my/summary', protect, async (req, res) => {
+  try {
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+    const data = await buildDaySummary(req.user._id, date);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('Tracker my/summary error:', err);
+    res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── GET /api/tracker/my/idle-stretches?date=YYYY-MM-DD ───────────────────────
+// Every idle stretch the tracker recorded for the caller on that day, each with
+// the reason they've already given (if any). This is what the web page lists so
+// the employee can explain each idle stretch — the job the tracker popup used
+// to do. idle_start/duration_sec are offset by IDLE_AFTER_SEC to match the
+// tracker's own reckoning of the stretch.
+router.get('/my/idle-stretches', protect, async (req, res) => {
+  try {
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+    const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const entries = await ActivityLog.find({
+      user_id: req.user._id,
+      is_idle: true,
+      start: { $gte: dayStart, $lt: dayEnd },
+    })
+      .sort({ start: 1 })
+      .select('entry_id start end duration_sec')
+      .lean();
+
+    const ids = entries.map((e) => e.entry_id);
+    const reasons = ids.length
+      ? await IdleReason.find({ reason_id: { $in: ids } }).select('reason_id reason updatedAt').lean()
+      : [];
+    const reasonMap = new Map(reasons.map((r) => [r.reason_id, r]));
+
+    const stretches = entries.map((e) => {
+      const r = reasonMap.get(e.entry_id);
+      return {
+        entry_id: e.entry_id,
+        idle_start: new Date(new Date(e.start).getTime() - IDLE_AFTER_SEC * 1000),
+        idle_end: e.end,
+        duration_sec: (e.duration_sec || 0) + IDLE_AFTER_SEC,
+        reason: r ? r.reason : '',
+        answered: Boolean(r),
+        answered_at: r ? r.updatedAt : null,
+      };
+    });
+
+    res.json({
+      success: true,
+      data: stretches,
+      pending: stretches.filter((s) => !s.answered).length,
+    });
+  } catch (err) {
+    console.error('Tracker my/idle-stretches error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load idle stretches' });
+  }
+});
+
+// ─── POST /api/tracker/my/idle-reason ─────────────────────────────────────────
+// The employee's reason for one of their own idle stretches, submitted from the
+// web app instead of the desktop popup. Body: { entry_id, reason }.
+// The stretch is identified by the ActivityLog entry_id, which must belong to
+// the caller and be an idle entry — so nobody can label someone else's time.
+// Upserts on reason_id, so the employee can edit a reason by resubmitting.
+router.post('/my/idle-reason', protect, async (req, res) => {
+  try {
+    const { entry_id, reason } = req.body || {};
+    const clean = String(reason || '').trim().slice(0, 300);
+    if (!entry_id || !clean) {
+      return res.status(400).json({ success: false, message: 'entry_id and reason are required' });
+    }
+
+    const entry = await ActivityLog.findOne({
+      entry_id: String(entry_id),
+      user_id: req.user._id,
+      is_idle: true,
+    })
+      .select('entry_id device_id start end duration_sec')
+      .lean();
+
+    if (!entry) {
+      return res.status(404).json({ success: false, message: 'Idle stretch not found' });
+    }
+
+    const idle_start = new Date(new Date(entry.start).getTime() - IDLE_AFTER_SEC * 1000);
+    const idle_end = new Date(entry.end);
+    const duration_sec = (entry.duration_sec || 0) + IDLE_AFTER_SEC;
+
+    await IdleReason.findOneAndUpdate(
+      { reason_id: String(entry.entry_id).slice(0, 64) },
+      {
+        $set: {
+          user_id: req.user._id,
+          device_id: entry.device_id,
+          idle_start,
+          idle_end,
+          duration_sec,
+          reason: clean,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    if (err.code === 11000) {
+      // Concurrent upsert on the same reason_id — the reason is stored, treat as success.
+      return res.json({ success: true, duplicate: true });
+    }
+    console.error('Tracker my/idle-reason error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save idle reason' });
   }
 });
 
