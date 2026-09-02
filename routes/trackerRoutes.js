@@ -1,6 +1,8 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const mongoose = require('mongoose');
 const router = express.Router();
 
 const User = require('../models/users');
@@ -11,6 +13,7 @@ const ActivityLog = require('../models/ActivityLog');
 const Screenshot = require('../models/Screenshot');
 const IdleReason = require('../models/IdleReason');
 const AppCategory = require('../models/AppCategory');
+const DailyProductivity = require('../models/DailyProductivity');
 const { classifyBatch } = require('../services/classificationService');
 const { buildTrackerDigest, sendTrackerDigest } = require('../services/trackerDigest');
 const { cloudinary } = require('../config/cloudinary');
@@ -510,6 +513,116 @@ router.get('/employee-summary', protect, authorise('admin', 'manager'), async (r
   } catch (err) {
     console.error('Tracker employee-summary error:', err);
     res.status(500).json({ success: false, message: 'Summary failed' });
+  }
+});
+
+// ─── AI daily brief ───────────────────────────────────────────────────────────
+// Turns the day's numbers into a short, factual paragraph an admin can skim.
+// Uses the same OpenAI key/model as the classifier, and caches the result on the
+// DailyProductivity row (keyed by a hash of the numbers) so repeated views don't
+// re-call the API. No key -> returns an empty brief, never an error.
+const OPENAI_BRIEF_URL = 'https://api.openai.com/v1/chat/completions';
+const BRIEF_MODEL = process.env.PRODUCTIVITY_BRIEF_MODEL || 'gpt-4o-mini';
+
+function briefContext(data, name) {
+  const mins = (s) => `${Math.round((s || 0) / 60)} min`;
+  const list = (arr) =>
+    (arr || []).slice(0, 5)
+      .map((i) => `${i.app_name}${i.window_title ? ': ' + i.window_title : ''} (${mins(i.seconds)})`)
+      .join('; ') || 'none';
+  const unprodPct = data.tracked_sec ? Math.round((data.unproductive_sec / data.tracked_sec) * 100) : 0;
+  return [
+    name ? `Employee: ${name}` : null,
+    `Active tracked time: ${mins(data.tracked_sec)}`,
+    `Idle time: ${mins(data.idle_sec)}`,
+    `Productive: ${data.productive_pct}% (${mins(data.productive_sec)})`,
+    `Unproductive: ${unprodPct}% (${mins(data.unproductive_sec)})`,
+    `Top productive activity: ${list(data.productive_items)}`,
+    `Top unproductive activity: ${list(data.unproductive_items)}`,
+    `Projects worked on: ${(data.projects || []).slice(0, 5).map((p) => `${p.project_name} (${mins(p.seconds)})`).join('; ') || 'none'}`,
+    `Idle stretches explained by employee: ${(data.idle_reasons || []).length}`,
+  ].filter(Boolean).join('\n');
+}
+
+async function generateBrief(context) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return '';
+  const prompt =
+    `You are writing a short daily activity summary for an admin reviewing an employee's ` +
+    `computer-usage tracking at a web development and digital marketing agency. ` +
+    `Write 2 to 3 plain, factual sentences. Describe how the time was spent, the balance of ` +
+    `productive vs unproductive activity, the main tools or projects, and mention idle time or ` +
+    `notable unproductive time only if it is significant. Keep a neutral, professional tone — ` +
+    `do not praise, scold, or speculate, and do not state anything that is not in the data.\n\n` +
+    `Data:\n${context}\n\nSummary:`;
+  try {
+    const res = await fetch(OPENAI_BRIEF_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: BRIEF_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 200,
+        temperature: 0.3,
+      }),
+    });
+    if (!res.ok) {
+      console.error('OpenAI brief failed:', res.status);
+      return '';
+    }
+    const data = await res.json();
+    return (data.choices?.[0]?.message?.content || '').trim();
+  } catch (err) {
+    console.error('OpenAI brief error:', err.message);
+    return '';
+  }
+}
+
+// GET /api/tracker/employee-summary/brief?user_id=&date=&refresh=1
+router.get('/employee-summary/brief', protect, authorise('admin', 'manager'), async (req, res) => {
+  try {
+    if (!req.query.user_id || !mongoose.Types.ObjectId.isValid(req.query.user_id)) {
+      return res.status(400).json({ success: false, message: 'Valid user_id is required' });
+    }
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    if (isNaN(date)) return res.status(400).json({ success: false, message: 'Invalid date' });
+
+    const uid = new mongoose.Types.ObjectId(req.query.user_id);
+    const data = await buildDaySummary(uid, date);
+    const day_key = data.date;
+
+    // Nothing tracked -> nothing to summarise.
+    if (!data.tracked_sec && !data.idle_sec) {
+      return res.json({ success: true, brief: '', empty: true });
+    }
+
+    const user = await User.findById(uid).select('name').lean();
+    const context = briefContext(data, user && user.name);
+    const signature = crypto.createHash('md5').update(context).digest('hex');
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+
+    if (!refresh) {
+      const row = await DailyProductivity.findOne({ user_id: uid, day_key }).select('brief brief_hash').lean();
+      if (row && row.brief && row.brief_hash === signature) {
+        return res.json({ success: true, brief: row.brief, cached: true });
+      }
+    }
+
+    const brief = await generateBrief(context);
+    if (!brief) {
+      return res.json({ success: true, brief: '', unavailable: true });
+    }
+    // Cache on the existing daily row if one exists (don't create a partial row —
+    // that would pollute the productivity list until the analyzer fills it).
+    DailyProductivity.updateOne(
+      { user_id: uid, day_key },
+      { $set: { brief, brief_hash: signature } }
+    ).catch(() => {});
+
+    res.json({ success: true, brief, cached: false });
+  } catch (err) {
+    console.error('Tracker brief error:', err);
+    res.status(500).json({ success: false, message: 'Failed to generate summary' });
   }
 });
 

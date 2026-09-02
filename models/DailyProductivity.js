@@ -79,6 +79,14 @@ const dailyProductivitySchema = new mongoose.Schema(
     ],
     idle_reasons_count: { type: Number, default: 0 },
 
+    // ── AI daily brief (admin quick-read) ─────────────────────────────────────
+    // A short plain-English paragraph summarising the day, generated on demand
+    // and cached here so repeated admin views don't re-call OpenAI. brief_hash
+    // is a fingerprint of the numbers the brief was written from — when the
+    // day's data changes materially, the hash differs and the brief regenerates.
+    brief: { type: String, default: '' },
+    brief_hash: { type: String, default: '' },
+
     computed_at: { type: Date, default: Date.now },
     method_version: { type: Number, default: 1 }, // bump when the blend changes
   },
