@@ -1,23 +1,36 @@
 // services/mailservice.js  (CommonJS)
 // Hostinger webmail bridge.
-//   READ  over IMAP  (imapflow)  — folders, list, search, read, delete, contacts
-//   SEND  over Brevo HTTPS API   — because this host BLOCKS outbound SMTP ports
-//   SAVE-TO-SENT over IMAP APPEND (SMTP never saves to Sent by itself)
+//   READ  over IMAP  (imapflow)            — folders, list, search, read, delete, contacts
+//   SEND  over Hostinger SMTP (nodemailer)  — authenticated as the employee's own
+//          mailbox, so mail genuinely goes out FROM their address.
+//   SAVE-TO-SENT over IMAP APPEND           — SMTP never saves to Sent by itself.
 //
-// deps:  npm i imapflow mailparser nodemailer @getbrevo/brevo
+// deps:  npm i imapflow mailparser nodemailer
 //
-// Sending requires BREVO_API_KEY in env, and the sender's DOMAIN must be
-// authenticated in Brevo (SPF/DKIM) — the same domain you already send with.
+// Sending uses the SAME Hostinger credentials the employee connected with (the
+// ones already used for IMAP) — no third-party relay and no API key needed.
+// Hetzner only blocks bare outbound port 25; the submission ports Hostinger
+// uses (465 implicit-TLS / 587 STARTTLS) are open, so direct SMTP works here.
 
 const { ImapFlow }     = require('imapflow');
 const { simpleParser } = require('mailparser');
+const nodemailer       = require('nodemailer');
 const MailComposer     = require('nodemailer/lib/mail-composer');
-const { BrevoClient, BrevoEnvironment } = require('@getbrevo/brevo');
 
 const IMAP = {
   host: process.env.HOSTINGER_IMAP_HOST || 'imap.hostinger.com',
   port: Number(process.env.HOSTINGER_IMAP_PORT) || 993,
   secure: true,
+};
+
+const SMTP = {
+  host: process.env.HOSTINGER_SMTP_HOST || 'smtp.hostinger.com',
+  // 465 = implicit TLS (SMTPS). Set HOSTINGER_SMTP_PORT=587 for STARTTLS.
+  port: Number(process.env.HOSTINGER_SMTP_PORT) || 465,
+  // secure:true for 465, false for 587. Overridable via HOSTINGER_SMTP_SECURE.
+  secure: process.env.HOSTINGER_SMTP_SECURE
+    ? process.env.HOSTINGER_SMTP_SECURE === 'true'
+    : (Number(process.env.HOSTINGER_SMTP_PORT) || 465) === 465,
 };
 
 function imapClient({ email, password }) {
@@ -213,54 +226,66 @@ async function getContacts(creds, perBox = 200) {
     .sort((a, b) => b.count - a.count || a.address.localeCompare(b.address));
 }
 
-// ── send over Brevo HTTPS (SMTP is blocked on this host) ───────────
-function parseAddrs(input) {
-  if (!input) return [];
-  const arr = Array.isArray(input) ? input : String(input).split(',');
-  return arr
-    .map((s) => {
-      const m = String(s).match(/<([^>]+)>/);
-      const email = (m ? m[1] : s).trim();
-      return email ? { email } : null;
-    })
-    .filter(Boolean);
+// ── send over Hostinger SMTP (authenticated as the employee) ───────
+// Normalises a recipient field to something nodemailer accepts directly:
+// takes a comma-separated string or an array, returns a trimmed string (or
+// undefined when empty). nodemailer parses "Name <addr>" forms itself.
+function addrList(input) {
+  if (!input) return undefined;
+  const s = Array.isArray(input) ? input.join(', ') : String(input);
+  return s.trim() ? s : undefined;
 }
 
 async function sendMessage(creds, {
   to, cc, bcc, subject, text, html, inReplyTo, references, attachments, fromName,
 }) {
-  if (!process.env.BREVO_API_KEY) {
-    const e = new Error('BREVO_API_KEY is not set — cannot send mail (SMTP is blocked on this host).');
-    e.code = 'ENOCONFIG';
-    throw e;
-  }
-  const toArr = parseAddrs(to);
-  if (toArr.length === 0) { const e = new Error('No valid recipient address'); e.code = 'ENORCPT'; throw e; }
+  const toList = addrList(to);
+  if (!toList) { const e = new Error('No valid recipient address'); e.code = 'ENORCPT'; throw e; }
 
-  const payload = {
-    sender: { email: creds.email, name: fromName || creds.email },
-    replyTo: { email: creds.email, name: fromName || creds.email },
-    to: toArr,
+  // Prefer whatever the client sent; guarantee at least one non-empty part so an
+  // attachment-only message still carries a valid (blank) body.
+  const htmlBody = html && html.trim() ? html : undefined;
+  let textBody = text && text.trim() ? text : undefined;
+  if (!htmlBody && !textBody) textBody = ' ';
+
+  const mail = {
+    from: fromName ? { name: fromName, address: creds.email } : creds.email,
+    to: toList,
+    cc: addrList(cc),
+    bcc: addrList(bcc),
     subject: subject || '(no subject)',
-    textContent: text && text.trim() ? text : ' ',
-    htmlContent: html && html.trim() ? html : (text ? text.replace(/\n/g, '<br>') : ' '),
+    text: textBody,
+    html: htmlBody,
+    inReplyTo: inReplyTo || undefined,
+    references: references && references.length ? references : undefined,
+    attachments: (attachments || []).map((a) => ({
+      filename: a.filename,
+      content: Buffer.from(a.content || '', 'base64'),
+      contentType: a.contentType || undefined,
+    })),
   };
-  const ccArr = parseAddrs(cc); if (ccArr.length) payload.cc = ccArr;
-  const bccArr = parseAddrs(bcc); if (bccArr.length) payload.bcc = bccArr;
-  const brevoAtt = (attachments || []).map((a) => ({ name: a.filename, content: a.content }));
-  if (brevoAtt.length) payload.attachment = brevoAtt;
-  const headers = {};
-  if (inReplyTo) headers['In-Reply-To'] = inReplyTo;
-  if (references && references.length) headers['References'] = references.join(' ');
-  if (Object.keys(headers).length) payload.headers = headers;
 
-  const client = new BrevoClient({ apiKey: process.env.BREVO_API_KEY, environment: BrevoEnvironment.Production });
-  const result = await client.transactionalEmails.sendTransacEmail(payload);
+  const transporter = nodemailer.createTransport({
+    host: SMTP.host,
+    port: SMTP.port,
+    secure: SMTP.secure,
+    auth: { user: creds.email, pass: creds.password },
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    socketTimeout: 30000,
+  });
 
-  // best-effort: save a copy to the Sent folder over IMAP
+  let info;
+  try {
+    info = await transporter.sendMail(mail);
+  } finally {
+    transporter.close();
+  }
+
+  // SMTP does not file a copy in Sent — do it ourselves over IMAP (best effort).
   await appendToSent(creds, { to, cc, subject, text, html, attachments, inReplyTo, references }).catch(() => {});
 
-  return { messageId: (result && result.messageId) || null, via: 'brevo' };
+  return { messageId: (info && info.messageId) || null, via: 'hostinger-smtp' };
 }
 
 async function appendToSent(creds, m) {
