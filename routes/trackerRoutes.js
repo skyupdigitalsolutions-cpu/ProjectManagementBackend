@@ -412,6 +412,27 @@ async function buildDaySummary(uid, date) {
     ]),
   ]);
 
+  // ── Untracked gaps ──────────────────────────────────────────────────────────
+  // Stretches where NO entry exists between one activity ending and the next
+  // starting. Idle time is a real entry (is_idle), so a genuine idle stretch is
+  // NOT a gap — only true absence of data is: the machine was asleep/suspended,
+  // shut down, or the tracker wasn't running. This is what explains a "total
+  // time" that's smaller than (last activity − first activity).
+  const GAP_MIN_SEC = 180; // ignore sub-3-minute gaps (normal scheduler jitter)
+  const gapRows = await ActivityLog.find(match).sort({ start: 1 }).select('start end').lean();
+  const gaps = [];
+  let untracked = 0;
+  for (let i = 1; i < gapRows.length; i++) {
+    const prevEnd = new Date(gapRows[i - 1].end).getTime();
+    const curStart = new Date(gapRows[i].start).getTime();
+    const gapSec = Math.round((curStart - prevEnd) / 1000);
+    if (gapSec >= GAP_MIN_SEC) {
+      gaps.push({ start: new Date(prevEnd), end: new Date(curStart), seconds: gapSec });
+      untracked += gapSec;
+    }
+  }
+  gaps.sort((a, b) => b.seconds - a.seconds);
+
   // Classify each app+title via manual rules + AI cache
   const { result: catMap, makeSignature } = await classifyBatch(
     appRows.map((a) => ({ app_name: a._id.app_name, window_title: a._id.window_title }))
@@ -488,6 +509,13 @@ async function buildDaySummary(uid, date) {
     tracked_sec: tracked,
     idle_sec: idle,
     total_sec: tracked + idle, // active + idle = time the tracker was on
+    // Span = last activity − first activity. untracked = span − total (the time
+    // the machine was asleep/off or the tracker wasn't running).
+    span_sec: span.length && span[0].first && span[0].last
+      ? Math.max(0, Math.round((new Date(span[0].last).getTime() - new Date(span[0].first).getTime()) / 1000))
+      : 0,
+    untracked_sec: untracked,
+    gaps: gaps.slice(0, 8),
     idle_reasons: idleReasons,
     productive_sec: productive,
     neutral_sec: neutral,
@@ -535,6 +563,7 @@ function briefContext(data, name) {
     name ? `Employee: ${name}` : null,
     `Active tracked time: ${mins(data.tracked_sec)}`,
     `Idle time: ${mins(data.idle_sec)}`,
+    `Untracked time (machine asleep/off or tracker not running): ${mins(data.untracked_sec)}`,
     `Productive: ${data.productive_pct}% (${mins(data.productive_sec)})`,
     `Unproductive: ${unprodPct}% (${mins(data.unproductive_sec)})`,
     `Top productive activity: ${list(data.productive_items)}`,
