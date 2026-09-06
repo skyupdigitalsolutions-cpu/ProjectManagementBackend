@@ -47,7 +47,7 @@ const ProjectSchema = mongoose.Schema(
         // ── Frontend PROJECT_TYPES (src/pages/admin/Projects.jsx) ──────────
         "website_development", "graphic_design", "ui_ux_design",
         "automation", "email_marketing", "branding", "machine_learning",
-        "google_ads", "role_based_dashboards",
+        "google_ads", "role_based_dashboards", "gmb",
       ],
       default: "other",
     },
@@ -63,7 +63,7 @@ const ProjectSchema = mongoose.Schema(
         // ── Frontend PROJECT_TYPES (src/pages/admin/Projects.jsx) ──────────
         "website_development", "graphic_design", "ui_ux_design",
         "automation", "email_marketing", "branding", "machine_learning",
-        "google_ads", "role_based_dashboards",
+        "google_ads", "role_based_dashboards", "gmb",
       ],
       default: [],
     },
