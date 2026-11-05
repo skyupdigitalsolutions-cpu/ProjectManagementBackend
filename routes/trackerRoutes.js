@@ -9,6 +9,7 @@ const User = require('../models/users');
 const Task = require('../models/tasks');
 const Policy = require('../models/policy');
 const Attendance = require('../models/attendance');
+const { istDayRange } = require('../services/attendanceRules');
 const ActivityLog = require('../models/ActivityLog');
 const Screenshot = require('../models/Screenshot');
 const IdleReason = require('../models/IdleReason');
@@ -50,12 +51,13 @@ async function getDailyLimitSec() {
 // write the same Attendance record (clock_out stays null until they punch out).
 async function getClockState(userId) {
   try {
-    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
-
+    // FIX: "today" is the IST day (Attendance.date is stored at 00:00 IST, see
+    // services/attendanceRules.js). The old server-midnight range missed
+    // today's punch on a non-IST server, so tracking stopped as if the
+    // employee hadn't clocked in. This range also finds older records.
     const record = await Attendance.findOne({
       user_id: userId,
-      date: { $gte: dayStart, $lt: dayEnd },
+      date: istDayRange(new Date()),
     })
       .select('clock_in clock_out')
       .sort({ clock_in: -1 })
