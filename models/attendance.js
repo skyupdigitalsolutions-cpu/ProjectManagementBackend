@@ -5,6 +5,10 @@ const RawLogSchema = new mongoose.Schema(
     time: { type: Date },
     type: { type: String },   // wrapped so Mongoose treats "type" as a field, not a type declaration
     verify: { type: String },
+    // Minutes of machine-clock correction already added to `time`
+    // (Policy.device_clock_offset_minutes at the moment it was saved).
+    // Missing on punches saved before this existed = not corrected yet.
+    clock_offset_applied: { type: Number },
   },
   { _id: false }
 );
