@@ -104,7 +104,16 @@ const updatePolicy = async (req, res) => {
     const { id } = req.params;
 
     // Prevent updating holidays via this endpoint (use dedicated endpoints below)
-    const { holidays, ...rest } = req.body;
+    const { holidays, device_clock_offset_since, ...rest } = req.body;
+
+    // Remember when the machine clock correction changes, so the repair script
+    // knows which stored punches were saved before the correction existed.
+    if (rest.device_clock_offset_minutes !== undefined) {
+      const current = await Policy.findById(id).select("device_clock_offset_minutes").lean();
+      if (current && Number(current.device_clock_offset_minutes || 0) !== Number(rest.device_clock_offset_minutes)) {
+        rest.device_clock_offset_since = new Date();
+      }
+    }
 
     const policy = await Policy.findByIdAndUpdate(
       id,
