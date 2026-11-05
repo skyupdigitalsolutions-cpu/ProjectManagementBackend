@@ -11,6 +11,7 @@
  */
 
 const Policy = require('../models/policy');
+const { invalidateRules } = require('../services/attendanceRules');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  getActivePolicy
@@ -80,6 +81,8 @@ const createPolicy = async (req, res) => {
       created_by: req.user._id,
     });
 
+    invalidateRules(); // new rules apply to the next punch
+
     return res.status(201).json({
       success: true,
       message: 'Policy created and set as active',
@@ -112,6 +115,8 @@ const updatePolicy = async (req, res) => {
     if (!policy) {
       return res.status(404).json({ success: false, message: 'Policy not found' });
     }
+
+    invalidateRules(); // new rules apply to the next punch
 
     return res.status(200).json({
       success: true,
@@ -161,6 +166,8 @@ const addHoliday = async (req, res) => {
     policy.holidays.sort((a, b) => new Date(a.date) - new Date(b.date));
     await policy.save();
 
+    invalidateRules(); // new rules apply to the next punch
+
     return res.status(201).json({
       success: true,
       message: `Holiday "${name}" added`,
@@ -200,6 +207,8 @@ const removeHoliday = async (req, res) => {
     }
 
     await policy.save();
+
+    invalidateRules(); // new rules apply to the next punch
 
     return res.status(200).json({
       success: true,
