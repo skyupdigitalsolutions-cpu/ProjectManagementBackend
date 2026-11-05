@@ -63,7 +63,7 @@ async function loadPolicy() {
 }
 
 // ─── One day for one person ──────────────────────────────────────────────────
-const SUMMARY_USER = "name email department designation role status fingerprint_id joining_date createdAt";
+const SUMMARY_USER = "name email department designation role status employee_id fingerprint_id work_mode joining_date createdAt";
 
 function punchesOf(rec) {
   if (rec.raw_logs?.length) return rec.raw_logs.map((l) => l.time).filter(Boolean).sort((a, b) => a - b);
@@ -71,6 +71,7 @@ function punchesOf(rec) {
 }
 
 function evaluate(rec, ymd, pol, today) {
+  if (rec.no_times) rec = { ...rec, clock_in: null, clock_out: null, hours_worked: null };
   const off = pol.weeklyOffs.includes(weekday(ymd)) || pol.holidays.has(ymd);
   const inProgress = ymd === today && !rec.clock_out;
   let hours = rec.hours_worked;
@@ -81,8 +82,9 @@ function evaluate(rec, ymd, pol, today) {
   const lateBy = rec.clock_in ? Math.max(0, istMinutes(rec.clock_in) - pol.lateAfter) : 0;
 
   let status = rec.status || "present";
-  // "absent" / "on-leave" set by an admin are kept; everything else follows the policy.
-  if (!["absent", "on-leave"].includes(status) && rec.clock_in) {
+  // Days an admin marked keep their status. "absent" / "on-leave" are kept too;
+  // everything else follows the policy.
+  if (!rec.admin_locked && !["absent", "on-leave"].includes(status) && rec.clock_in) {
     if (off) status = "present";
     else if (hours != null && hours < pol.halfDay && !inProgress) status = "half-day";
     else if (lateBy > 0) status = "late";
@@ -105,6 +107,7 @@ function evaluate(rec, ymd, pol, today) {
     source: rec.source || "manual",
     punches: punchesOf(rec),
     stored_status: rec.status,
+    ...adminInfo(rec),
   };
 }
 
@@ -160,11 +163,12 @@ async function loadRange(userIds, from, to) {
 }
 
 function summarise(days) {
-  const s = { working_days: 0, present: 0, late: 0, half_day: 0, leave: 0, absent: 0, holidays: 0, worked_off_days: 0,
+  const s = { wfh_days: 0, working_days: 0, present: 0, late: 0, half_day: 0, leave: 0, absent: 0, holidays: 0, worked_off_days: 0,
     total_hours: 0, overtime_hours: 0, early_logouts: 0, missing_logouts: 0, avg_login: null, avg_logout: null };
   const ins = [], outs = [];
   const today = todayIst();
   for (const d of days) {
+    if (d.work_from_home) s.wfh_days++;
     if (d.clock_in) ins.push(istMinutes(d.clock_in));
     if (d.clock_out) outs.push(istMinutes(d.clock_out));
     s.total_hours += d.hours_worked || 0;
@@ -187,6 +191,16 @@ function summarise(days) {
   s.attendance_pct = expected > 0 ? Math.round(((s.present + s.half_day * 0.5) / expected) * 1000) / 10 : null;
   return s;
 }
+
+const adminInfo = (rec) => ({
+  remark: rec.remark || "",
+  remark_by: rec.remark_by_name || null,
+  remark_at: rec.remark_at || null,
+  admin_locked: Boolean(rec.admin_locked),
+  marked_by: rec.marked_by_name || null,
+  marked_at: rec.marked_at || null,
+  work_from_home: rec.source === "wfh",
+});
 
 const policySummary = (pol) => ({
   work_start_time: pol.raw.work_start_time, work_end_time: pol.raw.work_end_time,
@@ -298,5 +312,109 @@ const getLeaveBalance = async (req, res) => {
   } catch (e) { fail(res, e); }
 };
 
-module.exports = { listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+// ─── Admin edits ─────────────────────────────────────────────────────────────
+
+// PATCH /api/attendance-app/user/:id/ids   { employee_id?, fingerprint_id? }
+// Empty string clears a value. Both must be unique across users.
+const setUserIds = async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) throw new HttpError(400, "Invalid user id");
+    const user = await User.findById(req.params.id);
+    if (!user) throw new HttpError(404, "User not found");
+    for (const field of ["employee_id", "fingerprint_id"]) {
+      if (req.body?.[field] === undefined) continue;
+      const value = String(req.body[field] ?? "").trim();
+      if (value.length > 40) throw new HttpError(400, `${field} is too long`);
+      if (value) {
+        const clash = await User.findOne({ [field]: value, _id: { $ne: user._id } }).select("name").lean();
+        if (clash) throw new HttpError(409, `${field === "employee_id" ? "Employee ID" : "Device ID"} "${value}" already belongs to ${clash.name}`);
+      }
+      user[field] = value || (field === "employee_id" ? undefined : null);
+    }
+    await user.save({ validateModifiedOnly: true });
+    const data = await User.findById(user._id).select(SUMMARY_USER).lean();
+    res.json({ success: true, data });
+  } catch (e) { fail(res, e); }
+};
+
+const HHMM = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+const atIst = (ymd, hhmm) => {
+  const m = HHMM.exec(String(hhmm));
+  if (!m) throw new HttpError(400, "Times must look like 09:30");
+  return new Date(dayStart(ymd).getTime() + (+m[1] * 60 + +m[2]) * 60000);
+};
+
+// PUT /api/attendance-app/record
+// { user_id, date: "YYYY-MM-DD", work_from_home?, status?, clock_in?, clock_out?, remark? }
+//   status: "auto" (from the times and the policy) | present | late | half-day | absent | on-leave
+//   clock_in / clock_out: "HH:mm" IST, or "" to clear
+//   remark: text, or "" to remove it
+// Changing work from home, status or times locks the day (fingerprint punches
+// are still logged but no longer change it). A remark alone doesn't lock.
+const saveDayRecord = async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!mongoose.Types.ObjectId.isValid(b.user_id)) throw new HttpError(400, "Invalid user id");
+    const date = parseYmd(b.date, "date");
+    if (date > todayIst()) throw new HttpError(400, "You can't mark a future day");
+    const user = await User.findById(b.user_id).select("name").lean();
+    if (!user) throw new HttpError(404, "User not found");
+
+    const range = { $gte: dayStart(date), $lt: new Date(dayStart(date).getTime() + DAY) };
+    let rec = await Attendance.findOne({ user_id: b.user_id, date: range }).sort({ clock_out: -1, clock_in: -1 });
+    const isNew = !rec;
+    if (!rec) rec = new Attendance({ user_id: b.user_id, date: dayStart(date), source: "manual", status: "present" });
+
+    const marking = ["work_from_home", "status", "clock_in", "clock_out"].some((k) => b[k] !== undefined);
+    if (rec.no_times) { rec.clock_in = undefined; rec.clock_out = null; }
+    if (b.clock_in !== undefined) rec.clock_in = b.clock_in ? atIst(date, b.clock_in) : undefined;
+    if (b.clock_out !== undefined) rec.clock_out = b.clock_out ? atIst(date, b.clock_out) : null;
+    if (rec.clock_in && rec.clock_out && rec.clock_out <= rec.clock_in) throw new HttpError(400, "Logout must be after login");
+    if (b.clock_in !== undefined || b.clock_out !== undefined) {
+      rec.hours_worked = rec.clock_in && rec.clock_out
+        ? round2(Math.max(0, (rec.clock_out - rec.clock_in) / 36e5 - (rec.break_minutes || 0) / 60)) : null;
+    }
+    if (b.work_from_home !== undefined) {
+      rec.source = b.work_from_home ? "wfh" : (rec.raw_logs?.length ? "fingerprint" : "manual");
+    }
+    if (!rec.clock_in) {
+      // The schema requires clock_in: a day marked without a login time keeps
+      // 00:00 IST there and is flagged no_times so it's never shown as a login.
+      rec.clock_in = dayStart(date);
+      rec.clock_out = null;
+      rec.hours_worked = null;
+      rec.no_times = true;
+    } else {
+      rec.no_times = false;
+    }
+    if (b.status !== undefined) {
+      const allowed = ["auto", "present", "late", "half-day", "absent", "on-leave"];
+      if (!allowed.includes(b.status)) throw new HttpError(400, `status must be one of: ${allowed.join(", ")}`);
+      if (b.status === "auto") {
+        const pol = await loadPolicy();
+        rec.status = !rec.no_times ? evaluate({ ...rec.toObject(), admin_locked: false }, date, pol, todayIst()).status
+          : rec.source === "wfh" ? "present" : "absent";
+      } else rec.status = b.status;
+    }
+    if (marking) {
+      Object.assign(rec, { admin_locked: true, marked_by: req.user._id, marked_by_name: req.user.name, marked_at: new Date() });
+    }
+    if (b.remark !== undefined) {
+      const text = String(b.remark || "").trim().slice(0, 500);
+      Object.assign(rec, text
+        ? { remark: text, remark_by: req.user._id, remark_by_name: req.user.name, remark_at: new Date() }
+        : { remark: "", remark_by: null, remark_by_name: null, remark_at: null });
+    }
+
+    await rec.save();
+    const pol = await loadPolicy();
+    const out = evaluate(rec.toObject(), date, pol, todayIst());
+    res.json({ success: true, data: { ...out, created: isNew } });
+  } catch (e) {
+    if (e.name === "ValidationError") return res.status(400).json({ success: false, message: Object.values(e.errors).map((x) => x.message).join("; ") });
+    fail(res, e);
+  }
+};
+
+module.exports = { setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
