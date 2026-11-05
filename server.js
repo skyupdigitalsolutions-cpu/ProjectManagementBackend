@@ -64,7 +64,7 @@ app.use((req, res, next) => {
 // online, add its https:// address here or in CORS_ORIGINS.
 const ALLOWED_ORIGINS = (
   process.env.CORS_ORIGINS ||
-  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000,http://127.0.0.1:3000,https://attendance-app.skyupdigitalsolutions.workers.dev/'
+  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000,http://127.0.0.1:3000,https://attendance-app.skyupdigitalsolutions.workers.dev'
 )
   .split(',')
   .map((s) => s.trim())
