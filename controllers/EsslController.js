@@ -236,10 +236,11 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
     deriveFromDistinct(distinct, new Date());
 
   // 7. Save the full deduped set with $set (NOT $push — avoids duplicate pile-up).
-  const record = await Attendance.findOneAndUpdate(
-    { user_id: userId, date },
-    {
-      $set: {
+  //    If an admin marked this day (admin_locked), keep their times/status/source
+  //    and only log the punches.
+  const update = existing?.admin_locked
+    ? { raw_logs: allPunches, device_serial: deviceSerial || null }
+    : {
         clock_in,
         clock_out,
         hours_worked,
@@ -248,7 +249,11 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
         source: "fingerprint",
         device_serial: deviceSerial || null,
         raw_logs: allPunches,
-      },
+      };
+  const record = await Attendance.findOneAndUpdate(
+    { user_id: userId, date },
+    {
+      $set: update,
     },
     { upsert: true, returnDocument: "after", runValidators: true }
   );
@@ -265,6 +270,27 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   }
 
   return record;
+};
+
+// ─── Who does a punch belong to? ─────────────────────────────────────────────
+// The machine sends its own user number for every punch ("Device ID").
+// 1st: the user whose fingerprint_id equals it.
+// 2nd: if nobody has that fingerprint_id, the user whose employee_id equals it
+//      (for machines enrolled with employee codes). Email is never used.
+const findUsersForDeviceIds = async (ids) => {
+  const list = [...new Set(ids.map((x) => String(x).trim()).filter(Boolean))];
+  const users = await User.find({ $or: [{ fingerprint_id: { $in: list } }, { employee_id: { $in: list } }] });
+  const byFp = new Map(), byEmp = new Map();
+  for (const u of users) {
+    if (u.fingerprint_id) byFp.set(String(u.fingerprint_id).trim(), u);
+    if (u.employee_id) byEmp.set(String(u.employee_id).trim(), u);
+  }
+  const map = new Map();
+  for (const id of list) {
+    const u = byFp.get(id) || byEmp.get(id);
+    if (u) map.set(id, u);
+  }
+  return map;
 };
 
 // ─── METHOD 1: ADMS PUSH RECEIVER ────────────────────────────────────────────
@@ -371,8 +397,8 @@ const admsReceiver = async (req, res) => {
 
     const fingerprintIds = [...new Set([...punchMap.keys()].map((k) => k.split("::")[0]))];
 
-    const users = await User.find({ fingerprint_id: { $in: fingerprintIds } });
-    const userByFpId = new Map(users.map((u) => [String(u.fingerprint_id), u]));
+    // Device ID → fingerprint_id first, then employee_id (see findUsersForDeviceIds)
+    const userByFpId = await findUsersForDeviceIds(fingerprintIds);
 
     const results = { saved: 0, skipped: 0, errors: [] };
 
@@ -381,7 +407,7 @@ const admsReceiver = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
-        console.warn(`[eSSL] ⚠️  No user with fingerprint_id="${fpId}" — punch skipped. Run PATCH /api/essl/assign-fingerprint to map this ID.`);
+        console.warn(`[eSSL] ⚠️  No user with Device ID (fingerprint_id) or Employee ID "${fpId}" — punch skipped. Set it in the admin app (People → person → IDs).`);
         results.skipped++;
         continue;
       }
@@ -468,8 +494,8 @@ const syncFromDevice = async (req, res) => {
     await zkInstance.disconnect();
 
     const fingerprintIds = [...new Set([...punchMap.keys()].map((k) => k.split("::")[0]))];
-    const users = await User.find({ fingerprint_id: { $in: fingerprintIds } });
-    const userByFpId = new Map(users.map((u) => [String(u.fingerprint_id), u]));
+    // Device ID → fingerprint_id first, then employee_id (see findUsersForDeviceIds)
+    const userByFpId = await findUsersForDeviceIds(fingerprintIds);
 
     const results = { saved: 0, skipped: 0, errors: [] };
 
