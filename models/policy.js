@@ -52,6 +52,7 @@ const PolicySchema = new mongoose.Schema(
     work_start_time:        { type: String, default: '09:00' },   // "HH:mm"
     work_end_time:          { type: String, default: '18:00' },
     late_threshold_minutes: { type: Number, default: 15 },        // grace before "late"
+    early_logout_grace_minutes: { type: Number, default: 0 },     // clock-out before end − grace = early logout
     half_day_hours:         { type: Number, default: 4 },
     full_day_hours:         { type: Number, default: 8 },
     weekly_offs:            { type: [Number], default: () => [0, 6] }, // 0=Sun … 6=Sat
