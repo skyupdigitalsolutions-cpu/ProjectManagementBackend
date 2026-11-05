@@ -15,6 +15,9 @@ router.get("/user/:id",      c.getUserTimeline);  // one employee, day by day
 router.get("/register",      c.getRegister);      // monthly register
 router.get("/leave-balance", c.getLeaveBalance);  // ?user_id=&year=
 router.patch("/user/:id/ids", c.setUserIds);      // set Employee ID / Device ID
+router.get("/ids",           c.listIds);          // everyone's IDs + unassigned machine IDs
+router.put("/ids",           c.saveIds);          // save many IDs at once (swaps allowed)
+router.delete("/ids/unassigned/:deviceId", c.discardUnassigned);
 router.put("/record",        c.saveDayRecord);    // mark a day: WFH, status, times, remark
 
 module.exports = router;
