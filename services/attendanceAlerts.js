@@ -30,6 +30,7 @@
  */
 
 const Attendance = require("../models/attendance");
+const rules = require("./attendanceRules");
 const User = require("../models/users");
 const { notifyAdmins } = require("./notify");
 const { sendTelegramMessage, isConfigured, escapeHtml } = require("./telegram");
@@ -41,12 +42,18 @@ const num = (v, fallback) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+// FIX: work start, late grace and the standard day now come from the ACTIVE
+// Policy (the same rules the attendance status uses), so a "LATE" in Telegram
+// always matches the status shown in the app. The env values are fallbacks
+// used only until the policy has been loaded.
 function cfg() {
   const [sh, sm] = String(process.env.WORK_START || "09:00").split(":").map(Number);
+  const r = rules.getRules();
+  const policyLoaded = r && r.workStartMinutes != null;
   return {
-    workStartMinutes: (Number.isFinite(sh) ? sh : 9) * 60 + (Number.isFinite(sm) ? sm : 0),
-    lateGrace: num(process.env.LATE_GRACE_MINUTES, 15),
-    standardHours: num(process.env.STANDARD_WORK_HOURS, 8),
+    workStartMinutes: policyLoaded ? r.workStartMinutes : (Number.isFinite(sh) ? sh : 9) * 60 + (Number.isFinite(sm) ? sm : 0),
+    lateGrace: policyLoaded ? r.lateGraceMinutes : num(process.env.LATE_GRACE_MINUTES, 15),
+    standardHours: policyLoaded ? r.fullDayHours : num(process.env.STANDARD_WORK_HOURS, 8),
     standardBreakMin: num(process.env.STANDARD_BREAK_MINUTES, 60),
     overtimeMinMinutes: num(process.env.OVERTIME_MIN_MINUTES, 15),
     loginPings: String(process.env.TELEGRAM_LOGIN_PINGS ?? "true").toLowerCase() !== "false",
@@ -159,6 +166,7 @@ function computeWorkStats(record, user = {}) {
  */
 async function handleClockInAlert(record, user) {
   try {
+    await rules.loadRules();
     const c = cfg();
     if (!c.loginPings || !isConfigured()) return;
     if (!record || record.login_notified) return;
@@ -202,6 +210,7 @@ async function handleClockInAlert(record, user) {
  */
 async function handleClockOutAlert(record, user) {
   try {
+    await rules.loadRules();
     if (!record || !record.clock_out || record.overtime_alerted) return;
 
     const stats = computeWorkStats(record, user);
@@ -243,11 +252,9 @@ async function handleClockOutAlert(record, user) {
 
 // ─── 3. DAILY DIGEST (all employees' login timings) ──────────────────────────
 
-/** Midnight (00:00) for the given date, server-local. */
+/** 00:00 IST of the IST day containing `date` (FIX: was server-local midnight). */
 function toMidnight(date = new Date()) {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  return rules.istDayStart(date);
 }
 
 /**
@@ -265,8 +272,10 @@ async function sendDailyAttendanceDigest(dateObj = new Date()) {
       return { ok: false, skipped: true };
     }
 
+    await rules.loadRules();
     const day = toMidnight(dateObj);
-    const records = await Attendance.find({ date: day })
+    // FIX: whole IST day, so records saved under the old convention are included.
+    const records = await Attendance.find({ date: rules.istDayRange(dateObj) })
       .populate("user_id", "name department dailyWorkingHours role status")
       .sort({ clock_in: 1 })
       .lean();
