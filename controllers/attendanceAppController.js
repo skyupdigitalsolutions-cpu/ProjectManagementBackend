@@ -20,6 +20,7 @@ const User       = require("../models/users");
 const Attendance = require("../models/attendance");
 const Leave      = require("../models/leave");
 const Policy     = require("../models/policy");
+const UnmatchedPunch = require("../models/unmatchedPunch");
 
 const IST = 5.5 * 60 * 60 * 1000;
 const DAY = 24 * 60 * 60 * 1000;
@@ -332,8 +333,96 @@ const setUserIds = async (req, res) => {
       user[field] = value || (field === "employee_id" ? undefined : null);
     }
     await user.save({ validateModifiedOnly: true });
+    const imported = await importForUser(user);
     const data = await User.findById(user._id).select(SUMMARY_USER).lean();
-    res.json({ success: true, data });
+    res.json({ success: true, data, imported });
+  } catch (e) { fail(res, e); }
+};
+
+// Imports kept (unassigned) machine punches that now belong to this user.
+async function importForUser(user) {
+  const { importUnmatchedPunches } = require("./EsslController"); // lazy: avoids a load cycle
+  const out = [];
+  for (const id of [user.fingerprint_id, user.employee_id].filter(Boolean)) {
+    // A Device ID that matches someone's fingerprint_id belongs to them, not to an employee_id match
+    if (id === user.employee_id && id !== user.fingerprint_id && await User.exists({ fingerprint_id: id, _id: { $ne: user._id } })) continue;
+    const r = await importUnmatchedPunches(id, user);
+    if (r.punches) out.push({ device_id: id, ...r });
+  }
+  return out;
+}
+
+const cleanId = (v) => {
+  const value = String(v ?? "").trim();
+  if (value.length > 40) throw new HttpError(400, `"${value.slice(0, 12)}…" is too long (max 40 characters)`);
+  return value;
+};
+
+// GET /api/attendance-app/ids
+// Everyone's Employee ID and Device ID, plus machine IDs that have punches but no owner.
+const listIds = async (req, res) => {
+  try {
+    const [users, unassigned] = await Promise.all([
+      User.find({}).select("name email department designation role status employee_id fingerprint_id").sort({ status: 1, name: 1 }).lean(),
+      UnmatchedPunch.find({}).select("device_id count first_seen last_seen punches").sort({ last_seen: -1 }).lean(),
+    ]);
+    res.json({
+      success: true,
+      data: users,
+      unassigned: unassigned.map((u) => ({ device_id: u.device_id, punches: u.punches.length, count: u.count, first_seen: u.first_seen, last_seen: u.last_seen })),
+    });
+  } catch (e) { fail(res, e); }
+};
+
+// PUT /api/attendance-app/ids   { changes: [{ user_id, employee_id?, fingerprint_id? }] }
+// Saves many people at once. Uniqueness is checked on the final result, so two
+// people's IDs can be swapped in one save. "" clears a value.
+const saveIds = async (req, res) => {
+  try {
+    const changes = Array.isArray(req.body?.changes) ? req.body.changes : [];
+    if (!changes.length) throw new HttpError(400, "No changes to save");
+    if (changes.length > 1000) throw new HttpError(400, "Too many changes at once");
+    const all = await User.find({}).select("name employee_id fingerprint_id").lean();
+    const byId = new Map(all.map((u) => [String(u._id), { ...u }]));
+    const touched = new Map();
+    for (const c of changes) {
+      const u = byId.get(String(c.user_id));
+      if (!u) throw new HttpError(404, `User ${c.user_id} not found`);
+      for (const f of ["employee_id", "fingerprint_id"]) if (c[f] !== undefined) u[f] = cleanId(c[f]) || null;
+      touched.set(String(u._id), u);
+    }
+    // Final state must be unique per field
+    for (const [f, label] of [["employee_id", "Employee ID"], ["fingerprint_id", "Device ID"]]) {
+      const seen = new Map();
+      for (const u of byId.values()) {
+        if (!u[f]) continue;
+        if (seen.has(u[f])) throw new HttpError(409, `${label} "${u[f]}" is given to both ${seen.get(u[f])} and ${u.name}`);
+        seen.set(u[f], u.name);
+      }
+    }
+    // Two steps so swaps don't trip the unique index: clear, then set.
+    const ids = [...touched.keys()];
+    await User.updateMany({ _id: { $in: ids } }, { $unset: { employee_id: "" }, $set: { fingerprint_id: null } });
+    for (const u of touched.values()) {
+      const set = { fingerprint_id: u.fingerprint_id || null };
+      if (u.employee_id) set.employee_id = u.employee_id;
+      await User.updateOne({ _id: u._id }, { $set: set });
+    }
+    const imported = [];
+    for (const id of ids) {
+      const user = await User.findById(id);
+      for (const r of await importForUser(user)) imported.push({ ...r, user: user.name });
+    }
+    res.json({ success: true, updated: ids.length, imported });
+  } catch (e) { fail(res, e); }
+};
+
+// DELETE /api/attendance-app/ids/unassigned/:deviceId — discard kept punches (e.g. test enrolments)
+const discardUnassigned = async (req, res) => {
+  try {
+    const r = await UnmatchedPunch.deleteOne({ device_id: String(req.params.deviceId).trim() });
+    if (!r.deletedCount) throw new HttpError(404, "Nothing kept for that Device ID");
+    res.json({ success: true });
   } catch (e) { fail(res, e); }
 };
 
@@ -416,5 +505,5 @@ const saveDayRecord = async (req, res) => {
   }
 };
 
-module.exports = { setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+module.exports = { listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
