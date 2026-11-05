@@ -113,7 +113,17 @@ const UserSchema = mongoose.Schema(
       max: [24, 'Daily working hours cannot exceed 24'],
     },
 
-    // ── eSSL Fingerprint ──────────────────────────────────────────────────────
+    // ── Employee ID (HR code, e.g. "SKY012") ──────────────────────────────────
+    // Shown in the admin app. Also used to match fingerprint punches when no
+    // user has the punch's device ID as fingerprint_id (for machines enrolled
+    // with employee codes).
+    employee_id: {
+      type: String,
+      trim: true,
+      default: undefined,
+    },
+
+    // ── eSSL Fingerprint (the user number on the machine = "Device ID") ──────
     fingerprint_id: {
       type: String,
       default: null,
@@ -269,6 +279,7 @@ UserSchema.pre('findOneAndUpdate', async function () {
 UserSchema.index({ role: 1, status: 1 });
 UserSchema.index({ department: 1 });
 UserSchema.index({ fingerprint_id: 1 }, { sparse: true });
+UserSchema.index({ employee_id: 1 }, { unique: true, partialFilterExpression: { employee_id: { $type: "string" } } });
 
 const User = mongoose.model('User', UserSchema);
 module.exports = User;
