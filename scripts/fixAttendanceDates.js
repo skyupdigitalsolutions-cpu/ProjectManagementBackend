@@ -7,6 +7,11 @@
  * Options:
  *   --from=YYYY-MM-DD   only records on/after this IST day (default: all)
  *   --keep-status       fix dates and merge duplicates, but don't recompute status
+ *   --correct-device-clock
+ *                       also correct machine punches that were saved without the
+ *                       clock correction set in Settings (Policy.device_clock_offset_minutes).
+ *                       Each such punch gets the correction added once and is marked,
+ *                       so running it again never shifts anything twice.
  *
  * What it does (uses MONGO_URI from .env, same as the server):
  *  1. Puts every record on the right IST day. The day is taken from clock_in
@@ -32,6 +37,8 @@ const { _internals: essl } = require("../controllers/EsslController");
 
 const APPLY = process.argv.includes("--apply");
 const KEEP_STATUS = process.argv.includes("--keep-status");
+const CORRECT_CLOCK = process.argv.includes("--correct-device-clock");
+const Policy = require("../models/policy");
 const FROM = (process.argv.find((a) => a.startsWith("--from=")) || "").slice(7) || null;
 const LOCKED = new Set(["absent", "on-leave"]);
 
@@ -43,9 +50,11 @@ function distinctPunches(logs) {
   const all = [];
   for (const l of logs) {
     const t = new Date(l.time);
-    if (Number.isNaN(t.getTime()) || seen.has(t.getTime())) continue;
-    seen.add(t.getTime());
-    all.push({ time: t, type: String(l.type ?? "0"), verify: String(l.verify ?? "1") });
+    const key = t.getTime() - (Number(l.clock_offset_applied) || 0) * 60 * 1000; // machine reading, like EsslController
+    if (Number.isNaN(t.getTime()) || seen.has(key)) continue;
+    seen.add(key);
+    all.push({ time: t, type: String(l.type ?? "0"), verify: String(l.verify ?? "1"),
+      ...(l.clock_offset_applied != null && { clock_offset_applied: l.clock_offset_applied }) });
   }
   all.sort((a, b) => a.time - b.time);
   const distinct = [];
@@ -57,7 +66,8 @@ function distinctPunches(logs) {
   return { all, distinct };
 }
 
-const dayOf = (r) => rules.istDateKey(r.clock_in || r.date);
+// IST day a record belongs to: its first (corrected) punch, else clock_in, else stored date
+const dayOf = (r) => r._dayKey || rules.istDateKey(r.clock_in || r.date);
 
 function plan(group, policy) {
   // Fullest record first: fingerprint with punches > has clock_out > has clock_in
@@ -83,7 +93,7 @@ function plan(group, policy) {
       for (const [k, v] of Object.entries({ clock_in: d.clock_in, clock_out: d.clock_out, hours_worked: d.hours_worked, break_minutes: d.break_minutes, status })) {
         if (changed(keep[k] ?? null, v ?? null)) set[k] = v;
       }
-      if (extras.length) { set.raw_logs = all; set.source = "fingerprint"; }
+      if (extras.length || group.some((r) => r._shifted)) { set.raw_logs = all; set.source = "fingerprint"; }
     }
   } else if (keep.clock_in) {
     // App / WFH clock-ins: merge times from duplicates, then policy status
@@ -109,8 +119,42 @@ function plan(group, policy) {
   console.log(`Connected to ${mongoose.connection.name}. Mode: ${APPLY ? "APPLY (writing changes)" : "DRY RUN (no changes)"}`);
   console.log(`Policy: late after ${Math.floor(policy.lateAfterMinutes / 60)}:${String(policy.lateAfterMinutes % 60).padStart(2, "0")} IST, half-day under ${policy.halfDayHours} h, weekly offs [${policy.weeklyOffs}], ${policy.holidays.size} holidays`);
 
+  // ── Machine clock correction for punches saved without it ──
+  let clockOffsetMin = 0;
+  if (CORRECT_CLOCK) {
+    const pol = await Policy.findOne({ is_active: true }).sort({ createdAt: -1 }).lean();
+    clockOffsetMin = Number(pol?.device_clock_offset_minutes || 0);
+    if (!clockOffsetMin) {
+      console.error("\n✋ Set the machine clock correction in Settings first (e.g. machine is behind by 30 minutes), then run this again.");
+      await mongoose.disconnect(); process.exit(1);
+    }
+    console.log(`Machine clock correction: ${clockOffsetMin > 0 ? "+" : ""}${clockOffsetMin} min for machine punches that haven't been corrected yet`);
+  }
+
   const filter = FROM ? { date: { $gte: new Date(rules.istDayStart(FROM).getTime() - rules.DAY_MS) } } : {};
   const records = await Attendance.find(filter).sort({ user_id: 1, date: 1 }).lean();
+
+  let punchesShifted = 0;
+  if (clockOffsetMin) {
+    for (const r of records) {
+      if (!r.raw_logs?.length) continue;
+      let changed = false;
+      // Each punch records the correction it already got (clock_offset_applied).
+      // Only punches that never got one are shifted, and they're marked, so
+      // running this again changes nothing.
+      r.raw_logs = r.raw_logs.map((l) => {
+        if (Number(l.clock_offset_applied) || 0) return l;
+        changed = true; punchesShifted++;
+        return { ...l, time: new Date(new Date(l.time).getTime() + clockOffsetMin * 60 * 1000), clock_offset_applied: clockOffsetMin };
+      });
+      if (changed) {
+        r._shifted = true;
+        // Group under the corrected day. (Don't overwrite clock_in here: the
+        // stored value must stay as-is so the change is detected and written.)
+        r._dayKey = rules.istDateKey(r.raw_logs.map((l) => new Date(l.time)).sort((a, b) => a - b)[0]);
+      }
+    }
+  }
 
   const groups = new Map();
   for (const r of records) {
@@ -151,6 +195,7 @@ function plan(group, policy) {
   for (const [t, n] of Object.entries(transitions)) console.log(`      ${t}: ${n}`);
   console.log(`  Clock-in/out/hours recomputed:    ${stats.timesChanged}`);
   console.log(`  Already correct:                  ${stats.untouched}`);
+  if (CORRECT_CLOCK) console.log(`  Machine punches time-corrected:   ${punchesShifted}`);
   if (samples.length) console.log(`\nExamples:\n${samples.join("\n")}`);
 
   if (APPLY && ops.length) {
