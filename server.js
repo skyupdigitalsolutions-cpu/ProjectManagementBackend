@@ -60,7 +60,7 @@ app.use((req, res, next) => {
 // to allow any origin (note: "*" cannot be combined with credentials per spec).
 const ALLOWED_ORIGINS = (
   process.env.CORS_ORIGINS ||
-  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com'
+  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000'
 )
   .split(',')
   .map((s) => s.trim())
