@@ -6,6 +6,14 @@
  *
  * Options:
  *   --from=YYYY-MM-DD   only records on/after this IST day (default: all)
+ *   --to=YYYY-MM-DD     only records on/before this IST day (default: all)
+ *   --offset=MINUTES    machine clock correction to use for old punches
+ *                       (default: the value set in Settings). Implies --correct-device-clock.
+ *   --restore=FILE      undo an earlier --apply using the backup file it wrote
+ *                       (preview first; add --apply to actually restore)
+ *
+ * Every --apply first saves the records it is about to change to
+ * backups/attendance-fix-<time>.json, so it can be undone with --restore.
  *   --keep-status       fix dates and merge duplicates, but don't recompute status
  *   --correct-device-clock
  *                       also correct machine punches that were saved without the
@@ -37,9 +45,20 @@ const { _internals: essl } = require("../controllers/EsslController");
 
 const APPLY = process.argv.includes("--apply");
 const KEEP_STATUS = process.argv.includes("--keep-status");
-const CORRECT_CLOCK = process.argv.includes("--correct-device-clock");
+const arg = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : null; };
+const OFFSET_ARG = arg("offset");
+const CORRECT_CLOCK = process.argv.includes("--correct-device-clock") || OFFSET_ARG !== null;
+const TO = arg("to");
+const RESTORE = arg("restore");
+const fs = require("fs");
+const path = require("path");
+const { EJSON } = mongoose.mongo.BSON;
 const Policy = require("../models/policy");
-const FROM = (process.argv.find((a) => a.startsWith("--from=")) || "").slice(7) || null;
+const FROM = arg("from");
+for (const [k, v] of [["from", FROM], ["to", TO]]) {
+  if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) { console.error(`--${k} must be YYYY-MM-DD`); process.exit(1); }
+}
+const inRange = (day) => (!FROM || day >= FROM) && (!TO || day <= TO);
 const LOCKED = new Set(["absent", "on-leave"]);
 
 const calcHours = (a, b) => Math.round(((new Date(b) - new Date(a)) / 36e5) * 100) / 100;
@@ -83,7 +102,10 @@ function plan(group, policy) {
   const lockedStatus = group.find((r) => LOCKED.has(r.status) && !r.clock_in)?.status;
   const logs = group.flatMap((r) => r.raw_logs || []);
 
-  if (logs.length) {
+  if (group.some((r) => r.admin_locked)) {
+    // An admin marked this day: never recompute it. Only keep punch log corrections.
+    if (group.some((r) => r._shifted) || extras.length) { set.raw_logs = distinctPunches(logs).all; }
+  } else if (logs.length) {
     // Re-derive the day from every punch the device sent (all merged records)
     const { all, distinct } = distinctPunches(logs);
     if (distinct.length) {
@@ -112,9 +134,27 @@ function plan(group, policy) {
   return { keep, extras, set, key };
 }
 
+// Puts back every record saved in a backup file (exactly as it was).
+async function restore(file) {
+  const data = EJSON.parse(fs.readFileSync(file, "utf8"), { relaxed: false });
+  const recs = data.records || [];
+  console.log(`Backup from ${new Date(data.created_at).toISOString()} (${(data.args || []).join(" ")}): ${recs.length} records`);
+  if (!APPLY) {
+    console.log("Nothing was written. Add --apply to restore these records exactly as they were.");
+    return mongoose.disconnect();
+  }
+  // Records written by the fixed code for the same person/day after the fix would
+  // duplicate the restored ones; the restore only puts back what was saved.
+  const ops = recs.map((doc) => ({ replaceOne: { filter: { _id: doc._id }, replacement: doc, upsert: true } }));
+  for (let i = 0; i < ops.length; i += 500) await Attendance.collection.bulkWrite(ops.slice(i, i + 500), { ordered: false });
+  console.log(`✅ Restored ${recs.length} records.`);
+  return mongoose.disconnect();
+}
+
 (async () => {
   const uri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/project-management";
   await mongoose.connect(uri);
+  if (RESTORE) return restore(RESTORE);
   const policy = await rules.loadRules(true);
   console.log(`Connected to ${mongoose.connection.name}. Mode: ${APPLY ? "APPLY (writing changes)" : "DRY RUN (no changes)"}`);
   console.log(`Policy: late after ${Math.floor(policy.lateAfterMinutes / 60)}:${String(policy.lateAfterMinutes % 60).padStart(2, "0")} IST, half-day under ${policy.halfDayHours} h, weekly offs [${policy.weeklyOffs}], ${policy.holidays.size} holidays`);
@@ -123,21 +163,29 @@ function plan(group, policy) {
   let clockOffsetMin = 0;
   if (CORRECT_CLOCK) {
     const pol = await Policy.findOne({ is_active: true }).sort({ createdAt: -1 }).lean();
-    clockOffsetMin = Number(pol?.device_clock_offset_minutes || 0);
+    clockOffsetMin = OFFSET_ARG !== null ? Number(OFFSET_ARG) : Number(pol?.device_clock_offset_minutes || 0);
+    if (!Number.isFinite(clockOffsetMin) || Math.abs(clockOffsetMin) > 720) {
+      console.error("\n✋ --offset must be a number of minutes between -720 and 720."); await mongoose.disconnect(); process.exit(1);
+    }
     if (!clockOffsetMin) {
-      console.error("\n✋ Set the machine clock correction in Settings first (e.g. machine is behind by 30 minutes), then run this again.");
+      console.error("\n✋ No correction to apply. Use --offset=30, or set the machine clock correction in Settings, then run this again.");
       await mongoose.disconnect(); process.exit(1);
     }
     console.log(`Machine clock correction: ${clockOffsetMin > 0 ? "+" : ""}${clockOffsetMin} min for machine punches that haven't been corrected yet`);
   }
 
-  const filter = FROM ? { date: { $gte: new Date(rules.istDayStart(FROM).getTime() - rules.DAY_MS) } } : {};
+  const filter = {};
+  if (FROM || TO) filter.date = {};
+  if (FROM) filter.date.$gte = new Date(rules.istDayStart(FROM).getTime() - rules.DAY_MS);
+  if (TO) filter.date.$lt = new Date(rules.istDayStart(TO).getTime() + 2 * rules.DAY_MS);
+  if (FROM || TO) console.log(`Only days ${FROM || "(start)"} to ${TO || "(today)"}`);
   const records = await Attendance.find(filter).sort({ user_id: 1, date: 1 }).lean();
 
   let punchesShifted = 0;
   if (clockOffsetMin) {
     for (const r of records) {
       if (!r.raw_logs?.length) continue;
+      if (!inRange(dayOf(r))) continue; // outside --from/--to: leave untouched
       let changed = false;
       // Each punch records the correction it already got (clock_offset_applied).
       // Only punches that never got one are shifted, and they're marked, so
@@ -159,7 +207,7 @@ function plan(group, policy) {
   const groups = new Map();
   for (const r of records) {
     const k = `${r.user_id}|${dayOf(r)}`;
-    if (FROM && dayOf(r) < FROM) continue;
+    if (!inRange(dayOf(r))) continue;
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(r);
   }
@@ -199,6 +247,15 @@ function plan(group, policy) {
   if (samples.length) console.log(`\nExamples:\n${samples.join("\n")}`);
 
   if (APPLY && ops.length) {
+    // Backup every record this run changes or deletes, so it can be undone.
+    const ids = ops.flatMap((o) => (o.updateOne ? [o.updateOne.filter._id] : o.deleteMany.filter._id.$in));
+    const originals = await Attendance.collection.find({ _id: { $in: ids } }).toArray();
+    const dir = path.join(__dirname, "..", "backups");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `attendance-fix-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+    fs.writeFileSync(file, EJSON.stringify({ created_at: new Date(), args: process.argv.slice(2), records: originals }, null, 0, { relaxed: false }));
+    console.log(`\n💾 Backup of ${originals.length} records: ${file}`);
+    console.log(`   Undo with: node scripts/fixAttendanceDates.js --restore=${path.relative(process.cwd(), file)} --apply`);
     for (let i = 0; i < ops.length; i += 500) await Attendance.bulkWrite(ops.slice(i, i + 500), { ordered: false });
     console.log(`\n✅ Applied ${ops.length} changes.`);
   } else if (!APPLY) {
