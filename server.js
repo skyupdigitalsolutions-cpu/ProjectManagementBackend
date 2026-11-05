@@ -58,9 +58,13 @@ app.use((req, res, next) => {
 // requested headers, and short-circuits preflight with a 204. Set CORS_ORIGINS
 // in the environment (comma-separated) to add/override allowed origins; use "*"
 // to allow any origin (note: "*" cannot be combined with credentials per spec).
+// Allowed browser origins. CORS_ORIGINS in .env (comma-separated) replaces this
+// list. Defaults: the main site, plus the Attendance Admin app while it's tested
+// from a local computer (http://localhost:3000). When the admin app is hosted
+// online, add its https:// address here or in CORS_ORIGINS.
 const ALLOWED_ORIGINS = (
   process.env.CORS_ORIGINS ||
-  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000'
+  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000,http://127.0.0.1:3000'
 )
   .split(',')
   .map((s) => s.trim())
