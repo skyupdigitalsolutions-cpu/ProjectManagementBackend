@@ -41,14 +41,15 @@
 const Attendance = require("../models/attendance");
 const User = require("../models/users");
 const { handleClockInAlert, handleClockOutAlert } = require("../services/attendanceAlerts");
+const rules = require("../services/attendanceRules");
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
-const toMidnight = (date = new Date()) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
+// FIX: the day a record belongs to is the IST calendar day, stored as 00:00 IST
+// (same convention as Attendancecontroller). d.setHours(0,0,0,0) used the
+// server's midnight, so on a UTC/CET server these records never matched the
+// attendance controller's queries. See services/attendanceRules.js.
+const toMidnight = (date = new Date()) => rules.istDayStart(date);
 
 // Punches closer together than this are treated as ONE punch (device re-sends,
 // employee re-taps because it didn't beep, etc.). 10 minutes is far below any
@@ -108,12 +109,10 @@ const istMinutes = (date) => {
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
 
-// Half-day if worked < 4h; late if the first punch is after 09:15 IST.
-const deriveStatus = (clockIn, workedHours = null) => {
-  if (workedHours != null && workedHours < 4) return "half-day";
-  if (istMinutes(clockIn) > 9 * 60 + 15) return "late";
-  return "present";
-};
+// FIX: status follows the ACTIVE Policy (work start + late grace, half-day
+// hours, weekly offs, holidays) instead of a hard-coded 09:15 / 4 h.
+// upsertAttendanceFromPunches() loads the policy before calling this.
+const deriveStatus = (clockIn, workedHours = null) => rules.deriveStatus(clockIn, workedHours);
 
 // Would this trailing punch, given the current time, count as end-of-day?
 const isEndOfDayPunch = (punchTime, now = new Date()) => {
@@ -180,6 +179,7 @@ const deriveFromDistinct = (distinct, now = new Date()) => {
  * clock_in / clock_out using the pairs + end-of-day model described up top.
  */
 const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial) => {
+  await rules.loadRules(); // current policy for deriveStatus (cached 60 s)
   const userId = user._id;
   const date = toMidnight(dateObj);
 
@@ -347,7 +347,7 @@ const admsReceiver = async (req, res) => {
       const punchTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
       if (isNaN(punchTime)) continue;
 
-      const dateKey = punchTime.toISOString().slice(0, 10);
+      const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fingerprintId}::${dateKey}`;
 
       if (!punchMap.has(mapKey)) punchMap.set(mapKey, []);
@@ -437,8 +437,10 @@ const syncFromDevice = async (req, res) => {
 
     for (const log of logs) {
       const fpId = String(log.deviceUserId);
-      const punchTime = new Date(log.recordTime);
-      const dateKey = punchTime.toISOString().slice(0, 10);
+      // FIX: node-zklib returns the device's IST wall-clock as SERVER-local time;
+      // re-read it as IST so it's correct on any server timezone.
+      const punchTime = rules.deviceLocalToInstant(log.recordTime);
+      const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fpId}::${dateKey}`;
 
       if (!punchMap.has(mapKey)) punchMap.set(mapKey, []);
@@ -626,4 +628,6 @@ module.exports = {
   getFingerprintMap,
   getDeviceConfig,
   pingDevice,
+  // Used by scripts/fixAttendanceDates.js to re-derive stored days the same way.
+  _internals: { deriveFromDistinct, PUNCH_MERGE_WINDOW_MS },
 };
