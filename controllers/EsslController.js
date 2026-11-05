@@ -187,26 +187,31 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   const existing = await Attendance.findOne({ user_id: userId, date });
   const priorLogs = existing?.raw_logs || [];
 
-  // 2. Merge prior + incoming punches.
+  // 2. Merge prior + incoming punches. Incoming first, so when the device
+  //    re-sends a punch the newly corrected copy wins over an older stored one.
   const incoming = punches.map((p) => ({
     time: new Date(p.time),
     type: String(p.type),
     verify: String(p.verify),
+    clock_offset_applied: Number(p.clock_offset_applied) || 0,
   }));
   const merged = [
+    ...incoming,
     ...priorLogs.map((l) => ({
       time: new Date(l.time),
       type: String(l.type),
       verify: String(l.verify),
+      ...(l.clock_offset_applied != null && { clock_offset_applied: l.clock_offset_applied }),
     })),
-    ...incoming,
   ];
 
-  // 3. De-duplicate by exact timestamp (the device re-sends the same punches).
+  // 3. De-duplicate (the device re-sends the same punches). Compare on the
+  //    machine's own clock reading — stored time minus the correction it got —
+  //    so a re-sent punch never appears twice, corrected and uncorrected.
   const seen = new Set();
   const allPunches = [];
   for (const p of merged) {
-    const key = p.time.getTime();
+    const key = p.time.getTime() - (Number(p.clock_offset_applied) || 0) * 60 * 1000;
     if (Number.isNaN(key) || seen.has(key)) continue;
     seen.add(key);
     allPunches.push(p);
@@ -337,6 +342,7 @@ const admsReceiver = async (req, res) => {
 
     const lines = rawBody.trim().split("\n").filter(Boolean);
     const punchMap = new Map(); // key: "fingerprint_id::YYYY-MM-DD" → [punches]
+    const clockRules = await rules.loadRules(); // for the machine clock correction
 
     for (const line of lines) {
       const parts = line.trim().split(/\t|\s{2,}/);
@@ -344,8 +350,10 @@ const admsReceiver = async (req, res) => {
 
       const [fingerprintId, datetimeStr, typeCode = "0", verifyCode = "1"] = parts;
       // Device sends local IST time (TimeZone=5.5). Parse as IST -> correct UTC.
-      const punchTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
-      if (isNaN(punchTime)) continue;
+      const deviceTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
+      if (isNaN(deviceTime)) continue;
+      // Machine clock correction from the Policy (e.g. +30 min when the machine runs behind)
+      const punchTime = rules.correctDeviceTime(deviceTime, clockRules);
 
       const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fingerprintId}::${dateKey}`;
@@ -356,6 +364,7 @@ const admsReceiver = async (req, res) => {
         time: punchTime,
         type: decodePunchType(typeCode),
         verify: decodeVerifyMethod(verifyCode),
+        clock_offset_applied: clockRules.deviceClockOffsetMinutes,
         dateKey,
       });
     }
@@ -434,12 +443,14 @@ const syncFromDevice = async (req, res) => {
     console.log(`[eSSL] Pulled ${logs.length} punch records from device`);
 
     const punchMap = new Map();
+    const clockRules = await rules.loadRules(); // for the machine clock correction
 
     for (const log of logs) {
       const fpId = String(log.deviceUserId);
       // FIX: node-zklib returns the device's IST wall-clock as SERVER-local time;
       // re-read it as IST so it's correct on any server timezone.
-      const punchTime = rules.deviceLocalToInstant(log.recordTime);
+      // ...then apply the machine clock correction from the Policy.
+      const punchTime = rules.correctDeviceTime(rules.deviceLocalToInstant(log.recordTime), clockRules);
       const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fpId}::${dateKey}`;
 
@@ -449,6 +460,7 @@ const syncFromDevice = async (req, res) => {
         time: punchTime,
         type: decodePunchType(log.inOutStatus),
         verify: "fingerprint",
+        clock_offset_applied: clockRules.deviceClockOffsetMinutes,
         dateKey,
       });
     }
