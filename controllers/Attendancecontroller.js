@@ -3,6 +3,7 @@ const Attendance = require("../models/attendance");
 const WfhRequest = require("../models/WfhRequest");
 const { handleClockInAlert, handleClockOutAlert, sendDailyAttendanceDigest } = require("../services/attendanceAlerts");
 const { sendTelegramMessage, isConfigured } = require("../services/telegram");
+const rules = require("../services/attendanceRules");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -151,18 +152,11 @@ const sumBreakMinutes = (breaks = []) =>
  * causing IST 09:10 clock-ins to be marked "late" (or vice-versa). We now
  * always derive the IST hour/minute via UTC math — TZ-independent.
  */
-const deriveStatus = (clockIn, clockOut = null) => {
-  const ist = new Date(new Date(clockIn).getTime() + IST_OFFSET_MS);
-  const totalMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-
-  if (clockOut) {
-    const worked = calcHours(new Date(clockIn), new Date(clockOut));
-    if (worked < 4) return "half-day";
-  }
-
-  if (totalMinutes > 9 * 60 + 15) return "late";
-  return "present";
-};
+// FIX: status follows the ACTIVE Policy (work start + late grace, half-day
+// hours, weekly offs, holidays) instead of hard-coded 09:00 / 09:15 / 4 h.
+// Callers await rules.loadRules() first so the policy is current.
+const deriveStatus = (clockIn, clockOut = null) =>
+  rules.deriveStatus(clockIn, clockOut ? calcHours(new Date(clockIn), new Date(clockOut)) : null);
 
 // ─── CLOCK IN ────────────────────────────────────────────────────────────────
 
@@ -187,6 +181,7 @@ const clockIn = async (req, res) => {
       return res.status(400).json({ success: false, message: "Already clocked in for today" });
     }
 
+    await rules.loadRules();
     const status = deriveStatus(now);
 
     const record = await Attendance.create({
@@ -237,6 +232,7 @@ const clockOut = async (req, res) => {
     record.break_minutes = sumBreakMinutes(record.breaks);
 
     const hours_worked = calcHours(record.clock_in, now);   // gross; net = gross − breaks
+    await rules.loadRules();
     const status = deriveStatus(record.clock_in, now);
 
     record.clock_out = now;
@@ -441,7 +437,9 @@ const getAllAttendance = async (req, res) => {
 
     const filter = {};
     if (status) filter.status = status;
-    if (date) filter.date = toMidnight(new Date(date));
+    // FIX: match the whole IST day, so records saved under the old (server
+    // midnight) convention are found too, not only exact IST-midnight ones.
+    if (date) filter.date = rules.istDayRange(new Date(date));
 
     const skip = (Number(page) - 1) * Number(limit);
 
