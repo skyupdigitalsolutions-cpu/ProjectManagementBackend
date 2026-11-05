@@ -82,8 +82,17 @@ function toRules(p = {}) {
     fullDayHours: p.full_day_hours ?? 8,
     weeklyOffs: Array.isArray(p.weekly_offs) ? p.weekly_offs : [0, 6],
     holidays: new Set((p.holidays || []).map((h) => istDateKey(h.date))),
+    deviceClockOffsetMinutes: Number(p.device_clock_offset_minutes) || 0,
   };
 }
+
+/**
+ * Real time of a punch from the fingerprint machine. The machine's own clock
+ * can drift; Policy.device_clock_offset_minutes says by how much (positive =
+ * machine is behind, so minutes are added).
+ */
+const correctDeviceTime = (instant, rules = getRules()) =>
+  new Date(new Date(instant).getTime() + (rules.deviceClockOffsetMinutes || 0) * 60 * 1000);
 
 const TTL_MS = 60 * 1000;
 let cache = null;
@@ -135,6 +144,7 @@ module.exports = {
   istDayRange,
   istMinutes,
   deviceLocalToInstant,
+  correctDeviceTime,
   loadRules,
   getRules,
   invalidateRules,
