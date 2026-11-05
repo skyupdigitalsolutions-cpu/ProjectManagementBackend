@@ -42,6 +42,7 @@ const Attendance = require("../models/attendance");
 const User = require("../models/users");
 const { handleClockInAlert, handleClockOutAlert } = require("../services/attendanceAlerts");
 const rules = require("../services/attendanceRules");
+const UnmatchedPunch = require("../models/unmatchedPunch");
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
@@ -293,6 +294,54 @@ const findUsersForDeviceIds = async (ids) => {
   return map;
 };
 
+// ─── Punches nobody owns yet ─────────────────────────────────────────────────
+// Kept (instead of dropped) until an admin assigns the Device ID to someone.
+const keepUnmatched = async (deviceId, punches, deviceSerial) => {
+  try {
+    if (!punches.length) return;
+    const times = punches.map((p) => new Date(p.time)).sort((a, b) => a - b);
+    const doc = (await UnmatchedPunch.findOne({ device_id: deviceId })) || new UnmatchedPunch({ device_id: deviceId, first_seen: times[0] });
+    const known = new Set(doc.punches.map((p) => +new Date(p.time) - (p.clock_offset_applied || 0) * 60000));
+    for (const p of punches) {
+      const key = +new Date(p.time) - (Number(p.clock_offset_applied) || 0) * 60000;
+      if (known.has(key)) continue; // device re-sent it
+      known.add(key);
+      doc.punches.push({ time: p.time, type: p.type, verify: p.verify, clock_offset_applied: p.clock_offset_applied, device_serial: deviceSerial || null });
+      doc.count += 1;
+    }
+    doc.punches.sort((a, b) => a.time - b.time);
+    if (doc.punches.length > UnmatchedPunch.MAX_KEPT) doc.punches = doc.punches.slice(-UnmatchedPunch.MAX_KEPT);
+    if (!doc.first_seen || times[0] < doc.first_seen) doc.first_seen = times[0];
+    if (!doc.last_seen || times[times.length - 1] > doc.last_seen) doc.last_seen = times[times.length - 1];
+    await doc.save();
+  } catch (err) {
+    console.error(`[eSSL] could not keep unmatched punches for Device ID ${deviceId}:`, err.message);
+  }
+};
+
+/**
+ * Imports the kept punches of `deviceId` into `user`'s attendance (grouped by
+ * IST day, same processing as live punches) and forgets them.
+ * Returns { punches, days }.
+ */
+const importUnmatchedPunches = async (deviceId, user) => {
+  const doc = await UnmatchedPunch.findOne({ device_id: String(deviceId).trim() });
+  if (!doc || !doc.punches.length) return { punches: 0, days: 0 };
+  const byDay = new Map();
+  for (const p of doc.punches) {
+    const day = rules.istDateKey(p.time);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push({ time: p.time, type: p.type, verify: p.verify, clock_offset_applied: p.clock_offset_applied });
+  }
+  for (const [day, punches] of byDay) {
+    await upsertAttendanceFromPunches(user, rules.istDayStart(day), punches, doc.punches[0].device_serial);
+  }
+  const n = doc.punches.length;
+  await doc.deleteOne();
+  console.log(`[eSSL] Imported ${n} earlier punches of Device ID ${deviceId} into ${user.name} (${byDay.size} days)`);
+  return { punches: n, days: byDay.size };
+};
+
 // ─── METHOD 1: ADMS PUSH RECEIVER ────────────────────────────────────────────
 
 const admsHandshake = async (req, res) => {
@@ -407,7 +456,8 @@ const admsReceiver = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
-        console.warn(`[eSSL] ⚠️  No user with Device ID (fingerprint_id) or Employee ID "${fpId}" — punch skipped. Set it in the admin app (People → person → IDs).`);
+        console.warn(`[eSSL] ⚠️  No user with Device ID (fingerprint_id) or Employee ID "${fpId}" — punch kept as unassigned. Assign it in the admin app (IDs).`);
+        await keepUnmatched(fpId, punches, deviceSerial);
         results.skipped++;
         continue;
       }
@@ -504,6 +554,7 @@ const syncFromDevice = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
+        await keepUnmatched(fpId, punches, device_serial || ip);
         results.skipped++;
         continue;
       }
@@ -667,5 +718,6 @@ module.exports = {
   getDeviceConfig,
   pingDevice,
   // Used by scripts/fixAttendanceDates.js to re-derive stored days the same way.
+  importUnmatchedPunches,
   _internals: { deriveFromDistinct, PUNCH_MERGE_WINDOW_MS },
 };
