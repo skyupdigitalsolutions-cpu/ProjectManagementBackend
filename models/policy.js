@@ -53,6 +53,11 @@ const PolicySchema = new mongoose.Schema(
     work_end_time:          { type: String, default: '18:00' },
     late_threshold_minutes: { type: Number, default: 15 },        // grace before "late"
     early_logout_grace_minutes: { type: Number, default: 0 },     // clock-out before end − grace = early logout
+    // Fingerprint machine clock correction. Positive = machine is BEHIND real
+    // time (e.g. 30 when it shows 9:00 at a real 9:30); negative = ahead.
+    // Every punch from the machine gets this many minutes added.
+    device_clock_offset_minutes: { type: Number, default: 0, min: -720, max: 720 },
+    device_clock_offset_since:   { type: Date, default: null },   // when the current offset was set (used by the repair script)
     half_day_hours:         { type: Number, default: 4 },
     full_day_hours:         { type: Number, default: 8 },
     weekly_offs:            { type: [Number], default: () => [0, 6] }, // 0=Sun … 6=Sat
