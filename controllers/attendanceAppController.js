@@ -729,6 +729,11 @@ const getMachine = async (req, res) => {
         last_ip: d.last_ip, last_punches_at: d.last_punches_at, last_punches_count: d.last_punches_count,
         users_count: (d.users || []).length, users_updated_at: d.users_updated_at,
         commands: (d.commands || []).slice(-6).reverse(),
+        users_pending: (d.commands || []).some((c) => (c.status === "queued" || c.status === "sent") && c.cmd.startsWith("DATA QUERY USERINFO")),
+        punches_pending: (d.commands || []).some((c) => (c.status === "queued" || c.status === "sent") && c.cmd.startsWith("DATA QUERY ATTLOG")),
+        last_handshake_at: d.last_handshake_at, last_handshake_query: d.last_handshake_query,
+        resend_all: Boolean(d.resend_all), resend_all_requested_at: d.resend_all_requested_at, resend_all_sent_at: d.resend_all_sent_at,
+        unknown_calls: (d.unknown_calls || []).slice(-5).reverse(),
       })),
       users: list,
       employees_without_device_id: people.filter((p) => p.status !== "inactive" && !p.fingerprint_id).map((p) => ({ _id: p._id, name: p.name, employee_id: p.employee_id || null })),
@@ -761,6 +766,27 @@ const machineResync = async (req, res) => {
     for (const sn of serials) {
       await queueDeviceCommand(sn, `DATA QUERY ATTLOG StartTime=${start}\tEndTime=${end}`, `Re-send punches ${from} to ${to}`, req.user.name || "");
     }
+    res.json({ success: true, data: { queued: serials.length, serials } });
+  } catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/machine/full-upload { serial? }
+// Older-firmware method: at its next connection the machine re-sends ALL punches and users.
+const machineFullUpload = async (req, res) => {
+  try {
+    const { requestFullUpload } = require("./EsslController");
+    const serials = await targetDevices(req.body?.serial);
+    for (const sn of serials) await requestFullUpload(sn, req.user.name || "");
+    res.json({ success: true, data: { queued: serials.length, serials } });
+  } catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/machine/restart { serial? } — the machine restarts and reconnects (about 1 minute)
+const machineRestart = async (req, res) => {
+  try {
+    const { queueDeviceCommand } = require("./EsslController");
+    const serials = await targetDevices(req.body?.serial);
+    for (const sn of serials) await queueDeviceCommand(sn, "REBOOT", "Restart the machine", req.user.name || "");
     res.json({ success: true, data: { queued: serials.length, serials } });
   } catch (e) { fail(res, e); }
 };
@@ -856,5 +882,5 @@ const createEmployeesFromMachine = async (req, res) => {
   } catch (e) { fail(res, e); }
 };
 
-module.exports = { createEmployeesFromMachine, getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+module.exports = { machineFullUpload, machineRestart, createEmployeesFromMachine, getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
