@@ -85,10 +85,51 @@ const storeMachineUsers = async (serial, rawBody) => {
   return users.length;
 };
 
+/**
+ * Many machines send the requested data but never post a separate confirmation
+ * to /iclock/devicecmd. So when punches or users arrive, mark the matching
+ * waiting request(s) as done, with what the machine sent.
+ */
+const completeCommands = async (serial, kind, result) => {
+  try {
+    const dev = await EsslDevice.findOne({ serial: String(serial) });
+    if (!dev) return;
+    const match = (c) => c.status === "sent" && (kind === "ATTLOG"
+      ? c.cmd.startsWith("DATA QUERY ATTLOG") || c.cmd === "CHECK"
+      : c.cmd.startsWith("DATA QUERY USERINFO") || c.cmd === "CHECK");
+    let n = 0;
+    for (const c of dev.commands) if (match(c)) { Object.assign(c, { status: "done", result, done_at: new Date() }); n++; }
+    if (n) { await dev.save(); console.log(`[eSSL] ✅ ${n} request(s) for ${serial} completed by data: ${result}`); }
+  } catch (e) { console.error("[eSSL] completeCommands:", e.message); }
+};
+
+/** Ask a machine to upload everything again (older-firmware method), then make it reconnect. */
+const requestFullUpload = async (serial, by = "") => {
+  await EsslDevice.updateOne({ serial: String(serial) },
+    { $set: { resend_all: true, resend_all_requested_at: new Date(), resend_all_sent_at: null } });
+  // CHECK makes most machines re-read the server options right away (the reconnect above)
+  return queueDeviceCommand(serial, "CHECK", "Upload everything again (older method)", by);
+};
+
+/** Any other /iclock call from the machine: log it, remember it, answer OK. */
+const unknownDeviceCall = async (req, res) => {
+  const serial = req.query.SN;
+  const what = `${req.method} ${req.path} ${JSON.stringify(req.query)} ${typeof req.body === "string" ? req.body.slice(0, 120) : ""}`.trim();
+  console.log(`[eSSL] ❓ Unknown machine call: ${what}`);
+  if (serial) {
+    EsslDevice.updateOne({ serial: String(serial) }, { $push: { unknown_calls: { $each: [`${new Date().toISOString()} ${what}`], $slice: -20 } } }).catch(() => {});
+  }
+  res.set("Content-Type", "text/plain");
+  res.send("OK");
+};
+
 /** Queue a command for a machine (picked up on its next poll). Used by the admin app. */
 const queueDeviceCommand = async (serial, cmd, label, by = "") => {
   const dev = await EsslDevice.findOne({ serial: String(serial) });
   if (!dev) throw new Error(`Machine ${serial} hasn't contacted the server yet`);
+  // Same request already waiting? Don't pile up duplicates.
+  const pending = dev.commands.find((c) => c.cmd === cmd && (c.status === "queued" || c.status === "sent"));
+  if (pending) return pending.id;
   const id = dev.next_cmd_id || 1;
   dev.next_cmd_id = id + 1;
   dev.commands.push({ id, cmd, label, created_by: by });
@@ -415,7 +456,8 @@ const importUnmatchedPunches = async (deviceId, user) => {
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;
-    touchDevice(SN, req.ip);
+    await touchDevice(SN, req.ip, { last_handshake_at: new Date(), last_handshake_query: JSON.stringify(req.query).slice(0, 400) });
+    const dev = SN ? await EsslDevice.findOne({ serial: String(SN) }).catch(() => null) : null;
     console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)} | TIME_SYNC=${TIME_SYNC}`);
 
     // Base options. TransTimes/TransFlag/Realtime tell the device WHAT and WHEN
@@ -449,6 +491,14 @@ const admsHandshake = async (req, res) => {
     // "off" (default): send neither TimeZone nor Date. The device keeps the
     // correct local time from its own Time Zone menu and is never overridden.
 
+    // "Upload everything again": stamps of 0 make the machine re-send its whole
+    // attendance log and its users (operation log). Works on old and new firmware.
+    if (dev?.resend_all) {
+      options.push("ATTLOGStamp=0", "OPERLOGStamp=0");
+      await EsslDevice.updateOne({ _id: dev._id }, { $set: { resend_all_sent_at: new Date() } });
+      console.log(`[eSSL] 🔁 Asked machine ${SN} to upload ALL punches and users again (stamps reset)`);
+    }
+
     res.set("Content-Type", "text/plain");
     res.send(options.join("\n") + "\n");
   } catch (err) {
@@ -466,12 +516,23 @@ const getRequest = async (req, res) => {
     if (!serial) return res.send("OK");
     await touchDevice(serial, req.ip);
     const dev = await EsslDevice.findOne({ serial: String(serial) });
-    // Re-send a command the machine received but never confirmed (after 10 min), else the next queued one
+    if (!dev) return res.send("OK");
+    // Give up on requests the machine never answered within 30 min (its firmware may not support them)
+    let changed = false;
+    for (const c of dev.commands) {
+      if (c.status === "sent" && c.sent_at && Date.now() - c.sent_at > 30 * 60 * 1000) {
+        Object.assign(c, { status: "failed", result: "No reply from the machine", done_at: new Date() });
+        changed = true;
+      }
+    }
+    // Next queued command; or retry once a command sent 10+ min ago that got no data back
     const stale = Date.now() - 10 * 60 * 1000;
-    const next = dev?.commands.find((c) => c.status === "queued" || (c.status === "sent" && c.sent_at && c.sent_at < stale && !c.result));
-    if (!next) return res.send("OK");
+    const next = dev.commands.find((c) => c.status === "queued") ||
+      dev.commands.find((c) => c.status === "sent" && c.sent_at < stale && !c.result && (c.attempts || 1) < 2 && c.cmd !== "REBOOT");
+    if (!next) { if (changed) await dev.save(); return res.send("OK"); }
     next.status = "sent";
     next.sent_at = new Date();
+    next.attempts = (next.attempts || 0) + 1;
     await dev.save();
     console.log(`[eSSL] 📤 Command ${next.id} → ${serial}: ${next.cmd.replace(/\t/g, " ")}`);
     return res.send(`C:${next.id}:${next.cmd}\n`);
@@ -520,8 +581,14 @@ const admsReceiver = async (req, res) => {
     console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
 
     touchDevice(deviceSerial, req.ip);
+    // The full re-upload has started arriving: stop asking for it at every connection
+    if (table === "ATTLOG" || table === "OPERLOG") {
+      EsslDevice.updateOne({ serial: String(deviceSerial), resend_all: true, resend_all_sent_at: { $ne: null } },
+        { $set: { resend_all: false } }).catch(() => {});
+    }
     if (table === "OPERLOG" || table === "USERINFO" || table === "OPLOG") {
       const n = await storeMachineUsers(deviceSerial, rawBody).catch((e) => { console.error("[eSSL] users:", e.message); return 0; });
+      if (n) await completeCommands(deviceSerial, "USERS", `Machine sent ${n} user${n === 1 ? "" : "s"}`);
       if (!n) console.log(`[eSSL] ⏭ ${table} from ${deviceSerial} (no user lines)`);
       res.set("Content-Type", "text/plain");
       return res.send("OK");
@@ -597,6 +664,7 @@ const admsReceiver = async (req, res) => {
     }
 
     touchDevice(deviceSerial, req.ip, { last_punches_at: new Date(), last_punches_count: lines.length });
+    await completeCommands(deviceSerial, "ATTLOG", `Machine sent ${lines.length} punch${lines.length === 1 ? "" : "es"}`);
     console.log(`[eSSL] Batch complete — saved:${results.saved} skipped:${results.skipped} errors:${results.errors.length}`);
 
     res.set("Content-Type", "text/plain");
@@ -846,5 +914,7 @@ module.exports = {
   importUnmatchedPunches,
   deviceCmd,
   queueDeviceCommand,
+  requestFullUpload,
+  unknownDeviceCall,
   _internals: { deriveFromDistinct, PUNCH_MERGE_WINDOW_MS },
 };
