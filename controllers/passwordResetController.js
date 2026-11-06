@@ -8,7 +8,8 @@
  *     Checks the code (5 tries max), sets the new password, clears the code.
  *
  * Email goes through Brevo, like the rest of the backend:
- *   BREVO_API_KEY, BREVO_FROM_EMAIL, BREVO_FROM_NAME (optional)
+ *   BREVO_API_KEY, and the sender address from BREVO_FROM_EMAIL or EMAIL_USER
+ *   (the same sender the existing email feature uses). Name: BREVO_FROM_NAME / EMAIL_FROM_NAME.
  */
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
@@ -24,18 +25,21 @@ const GENERIC = "If that email belongs to an account, a 6-digit code is on its w
 const hashCode = (userId, code) =>
   crypto.createHash("sha256").update(`${userId}:${code}:${process.env.JWT_SECRET || ""}`).digest("hex");
 
+const senderEmail = () => process.env.BREVO_FROM_EMAIL || process.env.EMAIL_USER || "";
+const senderName = () => process.env.BREVO_FROM_NAME || process.env.EMAIL_FROM_NAME || "SkyUp CRM";
+
 async function sendCodeEmail(user, code) {
-  if (!process.env.BREVO_API_KEY || !process.env.BREVO_FROM_EMAIL) {
+  if (!process.env.BREVO_API_KEY || !senderEmail()) {
     if (process.env.NODE_ENV !== "production") {
       console.warn(`[password-reset] Brevo not configured. Code for ${user.email}: ${code}`);
       return;
     }
-    throw new Error("BREVO_API_KEY / BREVO_FROM_EMAIL not set");
+    throw new Error("BREVO_API_KEY or the sender address (BREVO_FROM_EMAIL / EMAIL_USER) is not set");
   }
   const api = new Brevo.TransactionalEmailsApi();
   api.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
   const mail = new Brevo.SendSmtpEmail();
-  mail.sender = { name: process.env.BREVO_FROM_NAME || "SkyUp CRM", email: process.env.BREVO_FROM_EMAIL };
+  mail.sender = { name: senderName(), email: senderEmail() };
   mail.to = [{ email: user.email, name: user.name }];
   mail.subject = `${code} is your password reset code`;
   mail.htmlContent = `
