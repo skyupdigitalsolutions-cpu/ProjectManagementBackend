@@ -775,5 +775,86 @@ const machineFetchUsers = async (req, res) => {
   } catch (e) { fail(res, e); }
 };
 
-module.exports = { getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+// POST /api/attendance-app/machine/create-employees
+// { items: [{ pin, name, email?, employee_id? }], department, designation, no_email_ok?, dry_run? }
+// Creates employees for people enrolled on the fingerprint machine who have no employee record.
+// Device ID = the machine number (pin). Each gets a temporary password (returned once) and
+// any punches the machine already sent for that number are added to their attendance.
+const createEmployeesFromMachine = async (req, res) => {
+  try {
+    const b = req.body || {};
+    const items = Array.isArray(b.items) ? b.items : [];
+    if (!items.length) throw new HttpError(400, "Choose at least one person from the machine");
+    if (items.length > 200) throw new HttpError(400, "At most 200 people at once");
+    const department = String(b.department || "").trim(), designation = String(b.designation || "").trim();
+    if (!department) throw new HttpError(400, "Choose a department");
+    if (!designation) throw new HttpError(400, "Enter a designation");
+    const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    const existing = await User.find({}).select("email employee_id fingerprint_id name").lean();
+    const emails = new Map(existing.map((u) => [String(u.email || "").toLowerCase(), u.name]));
+    const empIds = new Map(existing.filter((u) => u.employee_id).map((u) => [String(u.employee_id).trim(), u.name]));
+    const devIds = new Map(existing.filter((u) => u.fingerprint_id).map((u) => [String(u.fingerprint_id).trim(), u.name]));
+    const seen = { email: new Set(), emp: new Set(), pin: new Set() };
+
+    const results = items.map((it, index) => {
+      const pin = String(it.pin || "").trim(), name = String(it.name || "").trim().slice(0, 100);
+      let email = String(it.email || "").trim().toLowerCase();
+      const employee_id = String(it.employee_id || "").trim();
+      const r = { index, pin, name, email, employee_id: employee_id || null };
+      const bad = (error) => ({ ...r, ok: false, error });
+      if (!pin) return bad("Machine number is missing");
+      if (devIds.has(pin)) return bad(`Device ID ${pin} already belongs to ${devIds.get(pin)}`);
+      if (seen.pin.has(pin)) return bad("This machine number is listed twice");
+      if (!name) return bad("Enter a name");
+      if (!email) {
+        if (!b.no_email_ok) return bad("Enter an email (or allow people without email)");
+        email = `device-${pin}@no-email.invalid`; // attendance-only staff; can't sign in until a real email is set
+        r.email = email; r.no_email = true;
+      }
+      if (!EMAIL.test(email)) return bad("Email doesn't look right");
+      if (emails.has(email)) return bad(`Email already used by ${emails.get(email)}`);
+      if (seen.email.has(email)) return bad("This email is listed twice");
+      if (employee_id && empIds.has(employee_id)) return bad(`Employee ID ${employee_id} already belongs to ${empIds.get(employee_id)}`);
+      if (employee_id && seen.emp.has(employee_id)) return bad("This Employee ID is listed twice");
+      seen.pin.add(pin); seen.email.add(email); if (employee_id) seen.emp.add(employee_id);
+      return { ...r, ok: true };
+    });
+
+    const ready = results.filter((r) => r.ok);
+    if (b.dry_run || !ready.length) return res.json({ success: true, data: { created: 0, ready: ready.length, results } });
+
+    const bcrypt = require("bcryptjs");
+    const crypto = require("crypto");
+    const { importUnmatchedPunches } = require("./EsslController");
+    const makePassword = () => {
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+      return Array.from({ length: 10 }, () => chars[crypto.randomInt(chars.length)]).join("");
+    };
+    let created = 0;
+    for (const r of ready) {
+      try {
+        const password = makePassword();
+        const user = await User.create({
+          name: r.name, email: r.email, password: await bcrypt.hash(password, 10),
+          role: "employee", status: "active", department, designation,
+          fingerprint_id: r.pin, ...(r.employee_id ? { employee_id: r.employee_id } : {}),
+        });
+        r.user_id = user._id;
+        if (!r.no_email) r.temporary_password = password; // shown once to the admin
+        const imp = await importUnmatchedPunches(r.pin, user).catch(() => ({ punches: 0 }));
+        r.imported_punches = imp.punches || 0;
+        created++;
+      } catch (err) {
+        r.ok = false;
+        r.error = err.code === 11000 ? "Email or ID already in use" : err.name === "ValidationError"
+          ? Object.values(err.errors).map((x) => x.message).join("; ") : "Couldn't create this person";
+        console.error("[create from machine]", r.pin, err.message);
+      }
+    }
+    res.json({ success: true, data: { created, ready: ready.length, results } });
+  } catch (e) { fail(res, e); }
+};
+
+module.exports = { createEmployeesFromMachine, getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
