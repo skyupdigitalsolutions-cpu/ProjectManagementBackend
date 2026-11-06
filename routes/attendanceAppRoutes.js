@@ -28,5 +28,7 @@ router.get("/machine",              c.getMachine);         // machines, their us
 router.post("/machine/resync",      c.machineResync);      // ask the machine to re-send punches
 router.post("/machine/fetch-users", c.machineFetchUsers);  // ask the machine for its user list
 router.post("/machine/create-employees", c.createEmployeesFromMachine); // add machine users as employees
+router.post("/machine/full-upload",  c.machineFullUpload);  // older firmware: re-send everything at next connection
+router.post("/machine/restart",      c.machineRestart);     // restart the machine (it reconnects)
 
 module.exports = router;
