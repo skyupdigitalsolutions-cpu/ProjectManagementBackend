@@ -24,5 +24,8 @@ router.post("/repair",       c.repairData);       // preview / apply the data re
 router.post("/repair/undo",  c.undoRepair);       // restore from a repair backup
 router.post("/holidays/bulk", c.bulkHolidays);    // add many holidays (preview with dry_run)
 router.post("/leaves/bulk",  c.bulkLeaves);       // record leave for many people (preview with dry_run)
+router.get("/machine",              c.getMachine);         // machines, their users, link status
+router.post("/machine/resync",      c.machineResync);      // ask the machine to re-send punches
+router.post("/machine/fetch-users", c.machineFetchUsers);  // ask the machine for its user list
 
 module.exports = router;
