@@ -19,5 +19,8 @@ router.get("/ids",           c.listIds);          // everyone's IDs + unassigned
 router.put("/ids",           c.saveIds);          // save many IDs at once (swaps allowed)
 router.delete("/ids/unassigned/:deviceId", c.discardUnassigned);
 router.put("/record",        c.saveDayRecord);    // mark a day: WFH, status, times, remark
+router.get("/data-health",   c.getDataHealth);    // split days, wrong dates, uncorrected punches
+router.post("/repair",       c.repairData);       // preview / apply the data repair
+router.post("/repair/undo",  c.undoRepair);       // restore from a repair backup
 
 module.exports = router;
