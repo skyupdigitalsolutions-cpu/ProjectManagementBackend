@@ -14,7 +14,7 @@ const root = path.join(__dirname, "..");
 const NEEDED = [
   "services/attendanceRules.js", "services/attendanceRepair.js",
   "controllers/attendanceAppController.js", "controllers/passwordResetController.js",
-  "routes/attendanceAppRoutes.js", "models/unmatchedPunch.js", "scripts/fixAttendanceDates.js",
+  "routes/attendanceAppRoutes.js", "models/unmatchedPunch.js", "models/esslDevice.js", "scripts/fixAttendanceDates.js",
   "routes/Index.js", "routes/Authroutes.js", "models/policy.js", "models/attendance.js", "models/users.js",
   "controllers/EsslController.js", "controllers/Attendancecontroller.js", "controllers/policyController.js",
   "services/attendanceAlerts.js", "routes/trackerRoutes.js",
@@ -43,6 +43,9 @@ try {
   require(path.join(root, "routes/Index"));
   require(path.join(root, "controllers/EsslController"));
   require(path.join(root, "services/attendanceRepair"));
+  const essl = require(path.join(root, "controllers/EsslController"));
+  if (typeof essl.deviceCmd !== "function") throw new Error("controllers/EsslController.js is an old version (no deviceCmd)");
+  if (!fs.readFileSync(path.join(root, "server.js"), "utf8").includes("/iclock/devicecmd")) throw new Error("server.js has no /iclock/devicecmd route: use the updated server.js");
   const r = require(path.join(root, "routes/attendanceAppRoutes"));
   const paths = r.stack.filter((l) => l.route).map((l) => l.route.path);
   console.log(`   ✓ loads; /api/attendance-app has ${paths.length} routes (${paths.join(", ")})`);
