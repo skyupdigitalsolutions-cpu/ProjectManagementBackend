@@ -22,5 +22,7 @@ router.put("/record",        c.saveDayRecord);    // mark a day: WFH, status, ti
 router.get("/data-health",   c.getDataHealth);    // split days, wrong dates, uncorrected punches
 router.post("/repair",       c.repairData);       // preview / apply the data repair
 router.post("/repair/undo",  c.undoRepair);       // restore from a repair backup
+router.post("/holidays/bulk", c.bulkHolidays);    // add many holidays (preview with dry_run)
+router.post("/leaves/bulk",  c.bulkLeaves);       // record leave for many people (preview with dry_run)
 
 module.exports = router;
