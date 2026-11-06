@@ -60,6 +60,7 @@ async function loadPolicy() {
     fullDay: p.full_day_hours ?? 8,
     weeklyOffs: p.weekly_offs ?? [0, 6],
     holidays: new Map((p.holidays || []).map((h) => [istYmd(h.date), h.name])),
+    clockOffset: Number(p.device_clock_offset_minutes) || 0,
   };
 }
 
@@ -107,6 +108,9 @@ function evaluate(rec, ymd, pol, today) {
     holiday: pol.holidays.get(ymd) || null,
     source: rec.source || "manual",
     punches: punchesOf(rec),
+    punch_details: (rec.raw_logs || []).map((l) => ({ time: l.time, correction_minutes: Number(l.clock_offset_applied) || 0 })).sort((a, b) => new Date(a.time) - new Date(b.time)),
+    uncorrected_punches: pol.clockOffset ? (rec.raw_logs || []).filter((l) => !(Number(l.clock_offset_applied) || 0)).length : 0,
+    split_records: rec.split_records || 1,
     stored_status: rec.status,
     ...adminInfo(rec),
   };
@@ -146,13 +150,22 @@ async function loadRange(userIds, from, to) {
     Attendance.find({ user_id: { $in: userIds }, date: { $gte: dayStart(from), $lt: new Date(dayStart(to).getTime() + DAY) } }).lean(),
     Leave.find({ user_id: { $in: userIds }, status: "approved", from_date: { $lte: new Date(dayStart(to).getTime() + DAY) }, to_date: { $gte: new Date(dayStart(from).getTime() - DAY) } }).lean(),
   ]);
-  const recMap = new Map(); // userId -> Map(ymd -> record)
+  // Group each person's records by IST day. A day can be split over several
+  // records (old/new date format, or app + machine): combine them, then work
+  // out login/logout/hours from ALL the punches, so a punch-out saved in a
+  // second record is never shown as "missing".
+  const groups = new Map(); // userId -> Map(ymd -> [records])
   for (const r of recs) {
-    const k = String(r.user_id), d = istYmd(r.date);
-    if (!recMap.has(k)) recMap.set(k, new Map());
-    const prev = recMap.get(k).get(d);
-    // Two records on one IST day (app clock-in + device): keep the fuller one.
-    if (!prev || (!prev.clock_out && r.clock_out) || (!prev.clock_in && r.clock_in)) recMap.get(k).set(d, r);
+    const k = String(r.user_id), d = istYmd(r.clock_in && !r.no_times ? r.clock_in : r.date);
+    if (!groups.has(k)) groups.set(k, new Map());
+    if (!groups.get(k).has(d)) groups.get(k).set(d, []);
+    groups.get(k).get(d).push(r);
+  }
+  const recMap = new Map();
+  for (const [k, byDay] of groups) {
+    const m = new Map();
+    for (const [d, list] of byDay) m.set(d, combineDay(list));
+    recMap.set(k, m);
   }
   const leaveMap = new Map();
   for (const l of leaves) {
@@ -161,6 +174,20 @@ async function loadRange(userIds, from, to) {
     leaveMap.get(k).push(l);
   }
   return { recMap, leaveMap };
+}
+
+function combineDay(list) {
+  const score = (r) => (r.admin_locked ? 8 : 0) + (r.raw_logs?.length ? 4 : 0) + (r.clock_out ? 2 : 0) + (r.clock_in ? 1 : 0);
+  const base = [...list].sort((a, b) => score(b) - score(a))[0];
+  const logs = list.flatMap((r) => r.raw_logs || []);
+  const rec = { ...base, raw_logs: logs, split_records: list.length };
+  if (rec.admin_locked || !logs.length) return rec; // admin's marking / app clock-in: as saved
+  const { distinctPunches } = require("../services/attendanceRepair");
+  const { deriveFromDistinct } = require("./EsslController")._internals;
+  const { all, distinct } = distinctPunches(logs);
+  if (!distinct.length) return rec;
+  const d = deriveFromDistinct(distinct, new Date()); // past days: the last punch counts as logout
+  return { ...rec, raw_logs: all, clock_in: d.clock_in, clock_out: d.clock_out, hours_worked: d.hours_worked, break_minutes: d.break_minutes };
 }
 
 function summarise(days) {
@@ -505,5 +532,166 @@ const saveDayRecord = async (req, res) => {
   }
 };
 
-module.exports = { listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+// GET /api/attendance-app/data-health — what (if anything) needs repairing
+const getDataHealth = async (req, res) => {
+  try { res.json({ success: true, data: await require("../services/attendanceRepair").dataHealth({ days: 90 }) }); }
+  catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/repair { apply?: boolean, correct_clock?: boolean }
+// Preview (default) or apply the same repair as scripts/fixAttendanceDates.js.
+const repairData = async (req, res) => {
+  try {
+    const { runRepair } = require("../services/attendanceRepair");
+    const r = await runRepair({
+      apply: req.body?.apply === true,
+      correctClock: req.body?.correct_clock === true,
+      args: ["admin-app", req.user.email || String(req.user._id)],
+    });
+    res.json({ success: true, data: { ...r, backupFile: r.backupFile ? require("path").basename(r.backupFile) : null } });
+  } catch (e) { fail(res, e.status ? e : Object.assign(e, { status: 400 })); }
+};
+
+// POST /api/attendance-app/repair/undo { backup: "attendance-fix-....json", apply?: boolean }
+const undoRepair = async (req, res) => {
+  try {
+    const name = String(req.body?.backup || "");
+    if (!/^attendance-fix-[\w.-]+\.json$/.test(name)) throw new HttpError(400, "Unknown backup file");
+    const file = require("path").join(__dirname, "..", "backups", name);
+    if (!require("fs").existsSync(file)) throw new HttpError(404, "Backup file not found on the server");
+    res.json({ success: true, data: await require("../services/attendanceRepair").restoreBackup(file, { apply: req.body?.apply === true }) });
+  } catch (e) { fail(res, e); }
+};
+
+// ─── Bulk entry ──────────────────────────────────────────────────────────────
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+const validDay = (d) => YMD_RE.test(String(d || "")) && istYmd(dayStart(d)) === d;
+
+// POST /api/attendance-app/holidays/bulk  { items: [{ date: "YYYY-MM-DD", name }], dry_run?: true }
+// Adds holidays to the active Policy. A date that's already a holiday is renamed if the name differs.
+const bulkHolidays = async (req, res) => {
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) throw new HttpError(400, "Add at least one holiday");
+    if (items.length > 400) throw new HttpError(400, "At most 400 holidays at once");
+    const policy = await Policy.findOne({ is_active: true }).sort({ createdAt: -1 });
+    if (!policy) throw new HttpError(404, "No active company policy");
+    const existing = new Map((policy.holidays || []).map((h) => [istYmd(h.date), h]));
+    const seen = new Set();
+    const results = items.map((it, index) => {
+      const date = String(it.date || "").trim(), name = String(it.name || "").trim().slice(0, 120);
+      if (!validDay(date)) return { index, date, name, ok: false, error: "Not a real date (check the day and month)" };
+      if (!name) return { index, date, name, ok: false, error: "Holiday name is missing" };
+      if (seen.has(date)) return { index, date, name, ok: false, error: "This date is listed twice" };
+      seen.add(date);
+      const old = existing.get(date);
+      if (old && old.name === name) return { index, date, name, ok: false, skipped: true, error: "Already a holiday" };
+      return { index, date, name, ok: true, action: old ? `rename "${old.name}"` : "add" };
+    });
+    const good = results.filter((r) => r.ok);
+    if (!req.body?.dry_run && good.length) {
+      for (const r of good) {
+        const old = existing.get(r.date);
+        if (old) old.name = r.name;
+        else policy.holidays.push({ date: new Date(`${r.date}T00:00:00Z`), name: r.name });
+      }
+      policy.holidays.sort((a, b) => a.date - b.date);
+      await policy.save();
+      require("../services/attendanceRules").invalidateRules();
+    }
+    res.json({ success: true, data: { saved: req.body?.dry_run ? 0 : good.length, ready: good.length, results } });
+  } catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/leaves/bulk
+// { items: [{ who | user_id, leave_type, from, to, reason? }], dry_run?: true }
+//   who: Employee ID, Device ID or email.  leave_type: key (casual) or label (Casual Leave).
+// Records approved leave on behalf of employees. Weekly offs and holidays aren't
+// counted; a row that overlaps the person's existing pending/approved leave is skipped.
+const bulkLeaves = async (req, res) => {
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) throw new HttpError(400, "Add at least one leave");
+    if (items.length > 500) throw new HttpError(400, "At most 500 leave rows at once");
+    const pol = await loadPolicy();
+    const types = pol.raw.leave_types || [];
+    const allowed = new Set(Leave.schema.path("leave_type").enumValues || []);
+    const typeOf = (t) => {
+      const v = String(t || "").trim().toLowerCase().replace(/\s+leave$/, "");
+      const hit = types.find((x) => x.type === v || String(x.label || "").toLowerCase().replace(/\s+leave$/, "") === v);
+      const key = hit ? hit.type : v;
+      return allowed.has(key) ? { key, label: hit?.label || key } : null;
+    };
+    const users = await User.find({}).select("name email employee_id fingerprint_id status").lean();
+    const byId = new Map(users.map((u) => [String(u._id), u]));
+    const byKey = new Map();
+    for (const u of users) {
+      if (u.employee_id) byKey.set(`e:${String(u.employee_id).trim().toLowerCase()}`, u);
+      if (u.fingerprint_id) byKey.set(`d:${String(u.fingerprint_id).trim().toLowerCase()}`, u);
+      if (u.email) byKey.set(`m:${u.email.toLowerCase()}`, u);
+    }
+    const findUser = (it) => {
+      if (it.user_id) return byId.get(String(it.user_id));
+      const w = String(it.who || "").trim().toLowerCase();
+      return byKey.get(`e:${w}`) || byKey.get(`m:${w}`) || byKey.get(`d:${w}`);
+    };
+    const isOff = (d) => pol.weeklyOffs.includes(weekday(d)) || pol.holidays.has(d);
+
+    const batch = []; // accepted rows so far, to catch overlaps inside the same upload
+    const results = [];
+    for (const [index, it] of items.entries()) {
+      const r = { index, who: it.who || it.user_id, from: it.from, to: it.to || it.from };
+      const u = findUser(it);
+      const t = typeOf(it.leave_type);
+      if (!u) { results.push({ ...r, ok: false, error: `No employee with Employee ID, Device ID or email "${it.who || it.user_id || ""}"` }); continue; }
+      r.user = { _id: u._id, name: u.name, employee_id: u.employee_id || null };
+      if (u.status === "inactive") { results.push({ ...r, ok: false, error: "This person is inactive" }); continue; }
+      if (!t) { results.push({ ...r, ok: false, error: `Unknown leave type "${it.leave_type || ""}" (use ${types.map((x) => x.type).join(", ")})` }); continue; }
+      r.leave_type = t.key; r.leave_label = t.label;
+      if (!validDay(r.from) || !validDay(r.to)) { results.push({ ...r, ok: false, error: "Not a real date (check the day and month)" }); continue; }
+      if (r.to < r.from) { results.push({ ...r, ok: false, error: "End date is before start date" }); continue; }
+      if ((Date.parse(r.to) - Date.parse(r.from)) / DAY > 90) { results.push({ ...r, ok: false, error: "One row can cover at most 90 days" }); continue; }
+      let days = 0;
+      for (let d = r.from; d <= r.to; d = addDays(d, 1)) if (!isOff(d)) days++;
+      r.days = days;
+      if (!days) { results.push({ ...r, ok: false, error: "Those dates are all weekly offs or holidays" }); continue; }
+      const clash = await Leave.findOne({ user_id: u._id, status: { $in: ["pending", "approved"] },
+        from_date: { $lte: new Date(`${r.to}T00:00:00Z`) }, to_date: { $gte: new Date(`${r.from}T00:00:00Z`) } }).lean();
+      if (clash) { results.push({ ...r, ok: false, error: `Overlaps ${clash.status} leave ${istYmd(clash.from_date)} to ${istYmd(clash.to_date)}` }); continue; }
+      if (batch.some((b) => String(b.user._id) === String(u._id) && b.from <= r.to && b.to >= r.from)) {
+        results.push({ ...r, ok: false, error: "Overlaps another row in this list" }); continue;
+      }
+      const reason = String(it.reason || "").trim();
+      r.reason = reason.length >= 20 ? reason.slice(0, 1000) : reason ? `${reason} (recorded by admin)`.padEnd(20, ".") : "Leave recorded by admin (bulk entry)";
+      r.ok = true;
+      batch.push(r);
+      results.push(r);
+    }
+    let saved = 0;
+    if (!req.body?.dry_run && batch.length) {
+      const docs = batch.map((r) => ({
+        user_id: r.user._id, leave_type: r.leave_type,
+        from_date: new Date(`${r.from}T00:00:00Z`), to_date: new Date(`${r.to}T00:00:00Z`), // same as the leave form saves
+        days: r.days, reason: r.reason, status: "approved",
+        reviewed_by: req.user._id, reviewed_at: new Date(), admin_note: `Added by ${req.user.name || "admin"} (bulk)`,
+      }));
+      const created = await Leave.insertMany(docs, { ordered: false });
+      saved = created.length;
+      // Let each employee know (same kind of in-app notification as a normal approval)
+      try {
+        const Notification = require("../models/notification");
+        await Notification.insertMany(created.map((l, i) => ({
+          user_id: l.user_id, sender_id: req.user._id, type: "general", ref_id: l._id,
+          message: `🗓️ ${batch[i].leave_label} recorded for you: ${batch[i].from === batch[i].to ? batch[i].from : `${batch[i].from} to ${batch[i].to}`} (${l.days} day${l.days === 1 ? "" : "s"}).`,
+        })));
+      } catch (err) { console.error("[bulk leave] notify failed:", err.message); }
+    }
+    res.json({ success: true, data: { saved, ready: batch.length, results } });
+  } catch (e) {
+    if (e.name === "ValidationError") return res.status(400).json({ success: false, message: Object.values(e.errors).map((x) => x.message).join("; ") });
+    fail(res, e);
+  }
+};
+
+module.exports = { bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
