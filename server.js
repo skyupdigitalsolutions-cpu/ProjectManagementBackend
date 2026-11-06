@@ -4,17 +4,19 @@ const helmet   = require('helmet');
 const morgan   = require('morgan');
 require('dotenv').config();
 
-// ─── Crash guards ─────────────────────────────────────────────────────────────
-// A single uncaught error (e.g. an IMAP socket 'error' event with no listener,
-// or a stray rejected promise) must NOT be able to take the whole API down for
-// every user. Log it loudly so it appears in the host logs, and keep serving.
-// This also turns silent process deaths into a readable stack trace you can act
-// on. (A truly fatal state will still surface; the host can restart if needed.)
 process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION:', reason);
 });
+// Before the server is listening, an error means it CANNOT start (for example a
+// missing file). Exit so the process manager shows the crash and restarts it,
+// instead of a silent process that answers nothing (the proxy then returns 502).
+let serverStarted = false;
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
+  if (!serverStarted) {
+    console.error('Server could not start. Fix the error above (run: node scripts/checkDeploy.js).');
+    process.exit(1);
+  }
 });
 
 const routes = require('./routes/Index');
@@ -23,27 +25,15 @@ const {
   admsHandshake,
   getRequest,
   admsReceiver,
+  deviceCmd,
 } = require('./controllers/EsslController');
 
 const app = express();
 
-// ─── Path normalisation (MUST be the very first middleware) ───────────────────
-// eSSL / ZKTeco firmware appends its hardcoded "/iclock/..." path to whatever is
-// typed into the device's "Server Address" field. If that field ends in a "/",
-// the device emits "//iclock/cdata.aspx". Express does NOT collapse duplicate
-// slashes, so "//iclock/cdata.aspx" never matches the "/iclock/cdata.aspx"
-// route and falls through to the 404 handler — the device retries forever and
-// no attendance data is ever ingested.
-//
-// Technicians re-enter that field on site and firmware builds differ, so we
-// normalise here instead of trusting the device config to stay correct.
-// Only the PATH is touched; the query string is preserved byte-for-byte so
-// values that legitimately contain "//" (URLs in params) are never mangled.
 app.use((req, res, next) => {
   const qIndex = req.url.indexOf('?');
   const pathname = qIndex === -1 ? req.url : req.url.slice(0, qIndex);
   const query = qIndex === -1 ? '' : req.url.slice(qIndex);
-
   const normalised = pathname.replace(/\/{2,}/g, '/');
   if (normalised !== pathname) {
     console.log(`[path-fix] ${pathname} → ${normalised}`);
@@ -52,16 +42,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── CORS (explicit, proxy-proof) ─────────────────────────────────────────────
-// Registered FIRST so the OPTIONS preflight is answered before helmet / routes
-// ever run. Reflects the request Origin when it's on the allow-list, echoes the
-// requested headers, and short-circuits preflight with a 204. Set CORS_ORIGINS
-// in the environment (comma-separated) to add/override allowed origins; use "*"
-// to allow any origin (note: "*" cannot be combined with credentials per spec).
-// Allowed browser origins. CORS_ORIGINS in .env (comma-separated) replaces this
-// list. Defaults: the main site, plus the Attendance Admin app while it's tested
-// from a local computer (http://localhost:3000). When the admin app is hosted
-// online, add its https:// address here or in CORS_ORIGINS.
 const ALLOWED_ORIGINS = (
   process.env.CORS_ORIGINS ||
   'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,http://localhost:3000,http://127.0.0.1:3000,https://attendance-app.skyupdigitalsolutions.workers.dev'
@@ -73,74 +53,49 @@ const ALLOWED_ORIGINS = (
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const allowAny = ALLOWED_ORIGINS.includes('*');
-
   if (origin && (allowAny || ALLOWED_ORIGINS.includes(origin))) {
-    // Reflect the specific origin (required when credentials are used).
     res.header('Access-Control-Allow-Origin', allowAny ? '*' : origin);
     res.header('Vary', 'Origin');
     if (!allowAny) res.header('Access-Control-Allow-Credentials', 'true');
-    res.header(
-      'Access-Control-Allow-Methods',
-      'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-    );
-    // Echo whatever headers the browser asked for (falls back to the usual set).
-    res.header(
-      'Access-Control-Allow-Headers',
-      req.headers['access-control-request-headers'] ||
-        'Authorization,Content-Type',
-    );
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.header('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || 'Authorization,Content-Type');
     res.header('Access-Control-Max-Age', '86400');
   }
-
-  // Answer the preflight immediately — nothing downstream needs to run.
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
-// crossOriginResourcePolicy is disabled so helmet's default
-// "Cross-Origin-Resource-Policy: same-origin" doesn't interfere with the API
-// being consumed from the separate frontend origin.
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// ─── eSSL ADMS plain-text body parser ────────────────────────────────────────
-// The device POSTs attendance logs as plain text, not JSON.
-// Must be registered before routes so req.body is available.
-// NOTE: the device firmware (iClock Proxy) calls the ".aspx" variants, so we
-// register the text parser for those paths too.
 app.use('/iclock/cdata',          express.text({ type: '*/*' }));
 app.use('/iclock/cdata.aspx',     express.text({ type: '*/*' }));
 app.use('/api/essl/iclock/cdata', express.text({ type: '*/*' }));
+app.use('/iclock/devicecmd',      express.text({ type: 'text/*' }));
+app.use('/iclock/devicecmd.aspx', express.text({ type: 'text/*' }));
 
-// ─── eSSL ADMS Device Routes (ROOT level — device cannot use /api prefix) ────
-// These are called directly by the eSSL hardware, not by your frontend.
-// The device always calls /iclock/cdata — this path is hardcoded in firmware.
-app.get('/iclock/cdata',      admsHandshake);  // Device registration / clock sync
-app.post('/iclock/cdata',     admsReceiver);   // Device pushes attendance punch logs
-app.get('/iclock/getrequest', getRequest);     // Device polling for server commands
-
-// Same handlers for the ".aspx" paths the device firmware actually calls
-// (seen in logs as POST /iclock/cdata.aspx?...&table=ATTLOG|OPERLOG).
+app.get('/iclock/cdata',      admsHandshake);
+app.post('/iclock/cdata',     admsReceiver);
+app.get('/iclock/getrequest', getRequest);
 app.get('/iclock/cdata.aspx',      admsHandshake);
 app.post('/iclock/cdata.aspx',     admsReceiver);
 app.get('/iclock/getrequest.aspx', getRequest);
 
+// The machine confirms commands it received from /iclock/getrequest (for example
+// "send punches for these dates again" or "send your user list").
+app.post('/iclock/devicecmd',      deviceCmd);
+app.post('/iclock/devicecmd.aspx', deviceCmd);
+
 const path = require('path');
 app.use('/uploads', require('./middleware/authMiddleware').protect, express.static(path.join(__dirname, 'uploads')));
 
-// ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.status(200).json({ success: true, message: 'Server is running', environment: process.env.NODE_ENV || 'development' });
 });
-
-// ─── Keep-alive (prevents Render free tier cold starts) ───────────────────────
-// Point UptimeRobot or any cron service at GET /ping every 5 minutes.
 app.get('/ping', (req, res) => res.send('pong'));
 
-// ─── Seed Admin ───────────────────────────────────────────────────────────────
 app.get('/seed-admin', async (req, res) => {
   try {
     const bcrypt = require('bcryptjs');
@@ -155,19 +110,13 @@ app.get('/seed-admin', async (req, res) => {
   }
 });
 
-// ─── API Routes ───────────────────────────────────────────────────────────────
-// FIX: excelTemplateRoutes must be mounted BEFORE app.use('/api', routes)
-// because the catch-all /api router would intercept the request first
-// and return 404 before excelTemplateRoutes ever gets a chance to handle it.
 app.use('/api/excel-template', require('./routes/Exceltemplateroutes'));
 app.use('/api', routes);
 
-// ─── 404 ─────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
 });
 
-// ─── Global Error Handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   const statusCode = err.statusCode || 500;
@@ -176,7 +125,6 @@ app.use((err, req, res, next) => {
   res.status(statusCode).json({ success: false, message });
 });
 
-// ─── Database + Server Startup ────────────────────────────────────────────────
 const PORT      = process.env.PORT      || 3000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/project-management';
 
@@ -188,6 +136,7 @@ mongoose
     const { initCronJobs } = require('./services/Cronscheduler');
     initCronJobs();
     app.listen(PORT, () => {
+      serverStarted = true;
       console.log(`Server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
     });
   })
