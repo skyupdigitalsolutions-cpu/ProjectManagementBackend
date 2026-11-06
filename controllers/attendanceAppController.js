@@ -728,7 +728,9 @@ const getMachine = async (req, res) => {
         serial: d.serial, last_seen: d.last_seen, online: d.last_seen && now - new Date(d.last_seen) < 3 * 60 * 1000,
         last_ip: d.last_ip, last_punches_at: d.last_punches_at, last_punches_count: d.last_punches_count,
         users_count: (d.users || []).length, users_updated_at: d.users_updated_at,
-        commands: (d.commands || []).slice(-6).reverse(),
+        // Waiting requests always; finished ones only for 10 minutes after they finished
+        commands: (d.commands || []).filter((c) => !["done", "failed"].includes(c.status) || c.done_at && now - new Date(c.done_at) < 10 * 60 * 1000)
+          .slice(-6).reverse(),
         users_pending: (d.commands || []).some((c) => (c.status === "queued" || c.status === "sent") && c.cmd.startsWith("DATA QUERY USERINFO")),
         punches_pending: (d.commands || []).some((c) => (c.status === "queued" || c.status === "sent") && c.cmd.startsWith("DATA QUERY ATTLOG")),
         last_handshake_at: d.last_handshake_at, last_handshake_query: d.last_handshake_query,
@@ -767,6 +769,17 @@ const machineResync = async (req, res) => {
       await queueDeviceCommand(sn, `DATA QUERY ATTLOG StartTime=${start}\tEndTime=${end}`, `Re-send punches ${from} to ${to}`, req.user.name || "");
     }
     res.json({ success: true, data: { queued: serials.length, serials } });
+  } catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/machine/clear-requests { serial?, id? }
+// Removes finished (done / not answered) requests from the list: one (id) or all.
+const machineClearRequests = async (req, res) => {
+  try {
+    const q = req.body?.serial ? { serial: String(req.body.serial) } : {};
+    const finished = { status: { $in: ["done", "failed"] }, ...(req.body?.id != null ? { id: Number(req.body.id) } : {}) };
+    const r = await EsslDevice.updateMany(q, { $pull: { commands: finished } });
+    res.json({ success: true, data: { updated: r.modifiedCount } });
   } catch (e) { fail(res, e); }
 };
 
@@ -882,5 +895,5 @@ const createEmployeesFromMachine = async (req, res) => {
   } catch (e) { fail(res, e); }
 };
 
-module.exports = { machineFullUpload, machineRestart, createEmployeesFromMachine, getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+module.exports = { machineClearRequests, machineFullUpload, machineRestart, createEmployeesFromMachine, getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
