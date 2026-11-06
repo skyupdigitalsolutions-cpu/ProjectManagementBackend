@@ -27,5 +27,6 @@ router.post("/leaves/bulk",  c.bulkLeaves);       // record leave for many peopl
 router.get("/machine",              c.getMachine);         // machines, their users, link status
 router.post("/machine/resync",      c.machineResync);      // ask the machine to re-send punches
 router.post("/machine/fetch-users", c.machineFetchUsers);  // ask the machine for its user list
+router.post("/machine/create-employees", c.createEmployeesFromMachine); // add machine users as employees
 
 module.exports = router;
