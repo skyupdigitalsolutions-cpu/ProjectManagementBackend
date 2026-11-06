@@ -43,6 +43,59 @@ const User = require("../models/users");
 const { handleClockInAlert, handleClockOutAlert } = require("../services/attendanceAlerts");
 const rules = require("../services/attendanceRules");
 const UnmatchedPunch = require("../models/unmatchedPunch");
+const EsslDevice = require("../models/esslDevice");
+
+// ─── Machine tracking + command queue ────────────────────────────────────────
+// Remember each machine (by serial) and when it last called in.
+const touchDevice = (serial, ip, extra = {}) => {
+  if (!serial) return Promise.resolve();
+  return EsslDevice.updateOne(
+    { serial: String(serial) },
+    { $set: { last_seen: new Date(), last_ip: ip || "", ...extra } },
+    { upsert: true }
+  ).catch((e) => console.error("[eSSL] device update failed:", e.message));
+};
+
+// Parse "KEY=value\tKEY=value" (machine user lines) into an object.
+const parseKV = (line) => Object.fromEntries(
+  line.replace(/^USER\s+/, "").split("\t").map((kv) => {
+    const i = kv.indexOf("=");
+    return i > 0 ? [kv.slice(0, i).trim().toLowerCase(), kv.slice(i + 1).trim()] : null;
+  }).filter(Boolean)
+);
+
+// Store the users the machine reports (table OPERLOG "USER PIN=..." or USERINFO "PIN=...").
+const storeMachineUsers = async (serial, rawBody) => {
+  const users = [];
+  for (const line of rawBody.split("\n")) {
+    const t = line.trim();
+    if (!/^(USER\s+)?PIN=/i.test(t)) continue;
+    const kv = parseKV(t);
+    if (!kv.pin) continue;
+    users.push({ pin: String(kv.pin).trim(), name: kv.name || "", card: kv.card || "", privilege: kv.pri || kv.privilege || "" });
+  }
+  if (!users.length) return 0;
+  const dev = (await EsslDevice.findOne({ serial: String(serial) })) || new EsslDevice({ serial: String(serial) });
+  const byPin = new Map(dev.users.map((u) => [u.pin, u]));
+  for (const u of users) byPin.set(u.pin, u); // update / add (the machine may send the list in parts)
+  dev.users = [...byPin.values()].sort((a, b) => a.pin.localeCompare(b.pin, undefined, { numeric: true }));
+  dev.users_updated_at = new Date();
+  await dev.save();
+  console.log(`[eSSL] 👥 ${users.length} user(s) received from machine ${serial} (${dev.users.length} known)`);
+  return users.length;
+};
+
+/** Queue a command for a machine (picked up on its next poll). Used by the admin app. */
+const queueDeviceCommand = async (serial, cmd, label, by = "") => {
+  const dev = await EsslDevice.findOne({ serial: String(serial) });
+  if (!dev) throw new Error(`Machine ${serial} hasn't contacted the server yet`);
+  const id = dev.next_cmd_id || 1;
+  dev.next_cmd_id = id + 1;
+  dev.commands.push({ id, cmd, label, created_by: by });
+  if (dev.commands.length > 50) dev.commands = dev.commands.slice(-50);
+  await dev.save();
+  return id;
+};
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
@@ -362,6 +415,7 @@ const importUnmatchedPunches = async (deviceId, user) => {
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;
+    touchDevice(SN, req.ip);
     console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)} | TIME_SYNC=${TIME_SYNC}`);
 
     // Base options. TransTimes/TransFlag/Realtime tell the device WHAT and WHEN
@@ -403,9 +457,57 @@ const admsHandshake = async (req, res) => {
   }
 };
 
-const getRequest = (req, res) => {
+// The machine polls this every few seconds. Answer with the next queued command
+// ("C:<id>:<command>") or "OK" when there's nothing to do.
+const getRequest = async (req, res) => {
   res.set("Content-Type", "text/plain");
-  res.send("OK");
+  try {
+    const serial = req.query.SN;
+    if (!serial) return res.send("OK");
+    await touchDevice(serial, req.ip);
+    const dev = await EsslDevice.findOne({ serial: String(serial) });
+    // Re-send a command the machine received but never confirmed (after 10 min), else the next queued one
+    const stale = Date.now() - 10 * 60 * 1000;
+    const next = dev?.commands.find((c) => c.status === "queued" || (c.status === "sent" && c.sent_at && c.sent_at < stale && !c.result));
+    if (!next) return res.send("OK");
+    next.status = "sent";
+    next.sent_at = new Date();
+    await dev.save();
+    console.log(`[eSSL] 📤 Command ${next.id} → ${serial}: ${next.cmd.replace(/\t/g, " ")}`);
+    return res.send(`C:${next.id}:${next.cmd}\n`);
+  } catch (err) {
+    console.error("[eSSL] getrequest error:", err.message);
+    return res.send("OK");
+  }
+};
+
+// The machine confirms commands here: body lines like "ID=3&Return=0&CMD=DATA".
+const deviceCmd = async (req, res) => {
+  res.set("Content-Type", "text/plain");
+  try {
+    const serial = req.query.SN;
+    // Body is "ID=3&Return=0&CMD=DATA" lines (text), or already parsed into an object
+    // when the machine sends it form-encoded.
+    const answers = typeof req.body === "string"
+      ? req.body.split(/\n/).map((line) => Object.fromEntries(line.trim().split("&").map((p) => p.split("=")).filter((x) => x.length === 2)))
+      : req.body && typeof req.body === "object" ? [req.body] : [];
+    const dev = serial && (await EsslDevice.findOne({ serial: String(serial) }));
+    if (dev) {
+      for (const q of answers) {
+        const c = dev.commands.find((x) => String(x.id) === String(q.ID));
+        if (!c) continue;
+        const ret = Number(q.Return);
+        c.status = Number.isFinite(ret) && ret < 0 ? "failed" : "done";
+        c.result = `Return=${q.Return ?? "?"}`;
+        c.done_at = new Date();
+        console.log(`[eSSL] ✅ Machine ${serial} answered command ${c.id}: ${c.result}`);
+      }
+      await dev.save();
+    }
+  } catch (err) {
+    console.error("[eSSL] devicecmd error:", err.message);
+  }
+  return res.send("OK");
 };
 
 const admsReceiver = async (req, res) => {
@@ -417,6 +519,13 @@ const admsReceiver = async (req, res) => {
 
     console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
 
+    touchDevice(deviceSerial, req.ip);
+    if (table === "OPERLOG" || table === "USERINFO" || table === "OPLOG") {
+      const n = await storeMachineUsers(deviceSerial, rawBody).catch((e) => { console.error("[eSSL] users:", e.message); return 0; });
+      if (!n) console.log(`[eSSL] ⏭ ${table} from ${deviceSerial} (no user lines)`);
+      res.set("Content-Type", "text/plain");
+      return res.send("OK");
+    }
     if (table !== "ATTLOG") {
       console.log(`[eSSL] ⏭ Ignoring table: ${table} from device ${deviceSerial}`);
       res.set("Content-Type", "text/plain");
@@ -487,6 +596,7 @@ const admsReceiver = async (req, res) => {
       }
     }
 
+    touchDevice(deviceSerial, req.ip, { last_punches_at: new Date(), last_punches_count: lines.length });
     console.log(`[eSSL] Batch complete — saved:${results.saved} skipped:${results.skipped} errors:${results.errors.length}`);
 
     res.set("Content-Type", "text/plain");
@@ -734,5 +844,7 @@ module.exports = {
   pingDevice,
   // Used by scripts/fixAttendanceDates.js to re-derive stored days the same way.
   importUnmatchedPunches,
+  deviceCmd,
+  queueDeviceCommand,
   _internals: { deriveFromDistinct, PUNCH_MERGE_WINDOW_MS },
 };
