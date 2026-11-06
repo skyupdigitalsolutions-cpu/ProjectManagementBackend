@@ -693,5 +693,87 @@ const bulkLeaves = async (req, res) => {
   }
 };
 
-module.exports = { bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
+// ─── Fingerprint machine ─────────────────────────────────────────────────────
+const EsslDevice = require("../models/esslDevice");
+
+// GET /api/attendance-app/machine
+// Machines seen, their recent commands, and every user enrolled on them matched to employees.
+const getMachine = async (req, res) => {
+  try {
+    const [devices, people, unassigned] = await Promise.all([
+      EsslDevice.find({}).sort({ last_seen: -1 }).lean(),
+      User.find({}).select("name employee_id fingerprint_id status department").lean(),
+      UnmatchedPunch.find({}).select("device_id punches last_seen").lean(),
+    ]);
+    const byFp = new Map(people.filter((u) => u.fingerprint_id).map((u) => [String(u.fingerprint_id).trim(), u]));
+    const byEmp = new Map(people.filter((u) => u.employee_id).map((u) => [String(u.employee_id).trim(), u]));
+    const kept = new Map(unassigned.map((u) => [u.device_id, u.punches.length]));
+    const users = new Map();
+    for (const d of devices) for (const u of d.users || []) {
+      const x = users.get(u.pin) || { pin: u.pin, name: u.name, machines: [] };
+      x.machines.push(d.serial);
+      if (!x.name && u.name) x.name = u.name;
+      users.set(u.pin, x);
+    }
+    // IDs with punches but not in any machine list yet
+    for (const id of kept.keys()) if (!users.has(id)) users.set(id, { pin: id, name: "", machines: [] });
+    const list = [...users.values()].map((u) => {
+      const e = byFp.get(u.pin) || byEmp.get(u.pin) || null;
+      return { ...u, employee: e && { _id: e._id, name: e.name, employee_id: e.employee_id || null, fingerprint_id: e.fingerprint_id || null, status: e.status },
+        matched_by: e ? (byFp.get(u.pin) ? "device_id" : "employee_id") : null, unassigned_punches: kept.get(u.pin) || 0 };
+    }).sort((a, b) => (Boolean(a.employee) - Boolean(b.employee)) || a.pin.localeCompare(b.pin, undefined, { numeric: true }));
+    const now = Date.now();
+    res.json({ success: true, data: {
+      devices: devices.map((d) => ({
+        serial: d.serial, last_seen: d.last_seen, online: d.last_seen && now - new Date(d.last_seen) < 3 * 60 * 1000,
+        last_ip: d.last_ip, last_punches_at: d.last_punches_at, last_punches_count: d.last_punches_count,
+        users_count: (d.users || []).length, users_updated_at: d.users_updated_at,
+        commands: (d.commands || []).slice(-6).reverse(),
+      })),
+      users: list,
+      employees_without_device_id: people.filter((p) => p.status !== "inactive" && !p.fingerprint_id).map((p) => ({ _id: p._id, name: p.name, employee_id: p.employee_id || null })),
+    } });
+  } catch (e) { fail(res, e); }
+};
+
+const targetDevices = async (serial) => {
+  const q = serial ? { serial: String(serial) } : {};
+  const list = await EsslDevice.find(q).select("serial").lean();
+  if (!list.length) throw new HttpError(404, serial ? `Machine ${serial} hasn't contacted the server yet` : "No fingerprint machine has contacted the server yet");
+  return list.map((d) => d.serial);
+};
+
+// POST /api/attendance-app/machine/resync { from, to, serial? }
+// Asks the machine to send its punches for these dates again. Already-saved punches are ignored.
+const machineResync = async (req, res) => {
+  try {
+    const from = parseYmd(req.body?.from, "from"), to = parseYmd(req.body?.to || req.body?.from, "to");
+    if (to < from) throw new HttpError(400, "End date is before start date");
+    if ((Date.parse(to) - Date.parse(from)) / DAY > 62) throw new HttpError(400, "Pick at most 2 months at a time");
+    // The machine searches by its OWN clock: widen by the clock correction so nothing at the edges is missed.
+    const pol = await loadPolicy();
+    const pad = Math.abs(pol.clockOffset || 0);
+    const fmt = (ms) => new Date(ms + IST).toISOString().replace("T", " ").slice(0, 19);
+    const start = fmt(dayStart(from).getTime() - pad * 60000);
+    const end = fmt(dayStart(to).getTime() + DAY - 1000 + pad * 60000);
+    const { queueDeviceCommand } = require("./EsslController");
+    const serials = await targetDevices(req.body?.serial);
+    for (const sn of serials) {
+      await queueDeviceCommand(sn, `DATA QUERY ATTLOG StartTime=${start}\tEndTime=${end}`, `Re-send punches ${from} to ${to}`, req.user.name || "");
+    }
+    res.json({ success: true, data: { queued: serials.length, serials } });
+  } catch (e) { fail(res, e); }
+};
+
+// POST /api/attendance-app/machine/fetch-users { serial? } — asks the machine for its user list
+const machineFetchUsers = async (req, res) => {
+  try {
+    const { queueDeviceCommand } = require("./EsslController");
+    const serials = await targetDevices(req.body?.serial);
+    for (const sn of serials) await queueDeviceCommand(sn, "DATA QUERY USERINFO", "Send the list of users", req.user.name || "");
+    res.json({ success: true, data: { queued: serials.length, serials } });
+  } catch (e) { fail(res, e); }
+};
+
+module.exports = { getMachine, machineResync, machineFetchUsers, bulkHolidays, bulkLeaves, getDataHealth, repairData, undoRepair, listIds, saveIds, discardUnassigned, setUserIds, saveDayRecord, listUsers, getDay, getUserTimeline, getRegister, getLeaveBalance,
   _internals: { evaluate, resolveDays, summarise, istYmd, dayStart } };
