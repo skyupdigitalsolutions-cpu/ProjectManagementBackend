@@ -30,5 +30,6 @@ router.post("/machine/fetch-users", c.machineFetchUsers);  // ask the machine fo
 router.post("/machine/create-employees", c.createEmployeesFromMachine); // add machine users as employees
 router.post("/machine/full-upload",  c.machineFullUpload);  // older firmware: re-send everything at next connection
 router.post("/machine/restart",      c.machineRestart);     // restart the machine (it reconnects)
+router.post("/machine/clear-requests", c.machineClearRequests); // remove finished requests from the list
 
 module.exports = router;
