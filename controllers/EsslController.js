@@ -185,8 +185,19 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   const date = toMidnight(dateObj);
 
   // 1. Load punches already stored for this user/day (full-day picture).
-  const existing = await Attendance.findOne({ user_id: userId, date });
-  const priorLogs = existing?.raw_logs || [];
+  //    FIX: look across the whole IST day, not one exact date value. Records
+  //    saved by the old code sit at a different midnight; without this, a day
+  //    got split in two (morning punch in one record, evening punch in another)
+  //    and both showed "punched in, no punch out". All punches are merged into
+  //    one record and the split copies are removed.
+  const dayRecs = await Attendance.find({ user_id: userId, date: rules.istDayRange(date) }).sort({ createdAt: 1 });
+  const existing =
+    dayRecs.find((r) => r.admin_locked) ||           // an admin's marking wins
+    dayRecs.find((r) => +r.date === +date) ||        // already on the right midnight
+    dayRecs.find((r) => r.raw_logs?.length) ||
+    dayRecs[0] || null;
+  const splitCopies = dayRecs.filter((r) => r !== existing && (r.source === "fingerprint" || r.raw_logs?.length));
+  const priorLogs = [...(existing?.raw_logs || []), ...splitCopies.flatMap((r) => r.raw_logs || [])];
 
   // 2. Merge prior + incoming punches. Incoming first, so when the device
   //    re-sends a punch the newly corrected copy wins over an older stored one.
@@ -252,12 +263,16 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
         raw_logs: allPunches,
       };
   const record = await Attendance.findOneAndUpdate(
-    { user_id: userId, date },
+    existing ? { _id: existing._id } : { user_id: userId, date },
     {
-      $set: update,
+      $set: { ...update, date }, // always stored at 00:00 IST
     },
     { upsert: true, returnDocument: "after", runValidators: true }
   );
+  if (splitCopies.length) {
+    await Attendance.deleteMany({ _id: { $in: splitCopies.map((r) => r._id) } });
+    console.log(`[eSSL] Merged ${splitCopies.length} split record(s) for ${user.name} on ${rules.istDateKey(date)}`);
+  }
 
   // ─── Fire attendance alerts on state transitions ─────────────────────────
   // Login ping: only when this is the first punch of the day (record is new).
