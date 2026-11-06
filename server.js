@@ -26,6 +26,7 @@ const {
   getRequest,
   admsReceiver,
   deviceCmd,
+  unknownDeviceCall,
 } = require('./controllers/EsslController');
 
 const app = express();
@@ -87,6 +88,11 @@ app.get('/iclock/getrequest.aspx', getRequest);
 // "send punches for these dates again" or "send your user list").
 app.post('/iclock/devicecmd',      deviceCmd);
 app.post('/iclock/devicecmd.aspx', deviceCmd);
+
+// Any other /iclock call from the machine (different firmware paths): log it and
+// answer OK instead of 404, so nothing the machine sends is silently lost.
+app.use('/iclock', express.text({ type: '*/*' }));
+app.all(/^\/iclock\//, unknownDeviceCall);
 
 const path = require('path');
 app.use('/uploads', require('./middleware/authMiddleware').protect, express.static(path.join(__dirname, 'uploads')));
