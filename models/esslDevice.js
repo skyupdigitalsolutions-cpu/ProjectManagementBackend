@@ -17,6 +17,7 @@ const CommandSchema = new mongoose.Schema(
     created_by: { type: String, default: "" },
     created_at: { type: Date, default: Date.now },
     sent_at: { type: Date, default: null },
+    attempts: { type: Number, default: 0 },
     done_at: { type: Date, default: null },
   },
   { _id: false }
@@ -43,6 +44,16 @@ const EsslDeviceSchema = new mongoose.Schema(
     commands: { type: [CommandSchema], default: [] },   // newest last, trimmed to 50
     users: { type: [MachineUserSchema], default: [] },
     users_updated_at: { type: Date, default: null },
+    // Last time the machine re-connected (GET /iclock/cdata?options=all) and what it said about itself
+    last_handshake_at: { type: Date, default: null },
+    last_handshake_query: { type: String, default: "" },
+    // "Upload everything again" (works on all firmware): at the next connection the server
+    // answers with ATTLOGStamp=0 / OPERLOGStamp=0, so the machine re-sends all punches and users.
+    resend_all: { type: Boolean, default: false },
+    resend_all_requested_at: { type: Date, default: null },
+    resend_all_sent_at: { type: Date, default: null },
+    // Calls from the machine to /iclock paths the server doesn't know (for diagnosis)
+    unknown_calls: { type: [String], default: [] },
   },
   { timestamps: true, collection: "essl_devices" }
 );
