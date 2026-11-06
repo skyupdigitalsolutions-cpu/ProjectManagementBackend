@@ -113,6 +113,12 @@ const UserSchema = mongoose.Schema(
       max: [24, 'Daily working hours cannot exceed 24'],
     },
 
+    // ── Forgot password: 6-digit code sent by email (only its hash is stored) ──
+    reset_code_hash:     { type: String, default: null, select: false },
+    reset_code_expires:  { type: Date, default: null, select: false },
+    reset_code_attempts: { type: Number, default: 0, select: false },
+    reset_code_sent_at:  { type: Date, default: null, select: false },
+
     // ── Employee ID (HR code, e.g. "SKY012") ──────────────────────────────────
     // Shown in the admin app. Also used to match fingerprint punches when no
     // user has the punch's device ID as fingerprint_id (for machines enrolled
