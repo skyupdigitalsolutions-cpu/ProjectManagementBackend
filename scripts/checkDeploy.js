@@ -33,9 +33,10 @@ for (const k of ["MONGO_URI", "JWT_SECRET"]) {
   if (!set) ok = false;
   console.log(`   ${set ? "✓" : "✗ NOT SET"}  ${k}`);
 }
-for (const k of ["BREVO_API_KEY", "BREVO_FROM_EMAIL"]) {
-  console.log(`   ${process.env[k] ? "✓" : "–  not set (forgot-password emails won't send)"}  ${k}`);
-}
+console.log(`   ${process.env.BREVO_API_KEY ? "✓" : "–  not set (forgot-password emails won't send)"}  BREVO_API_KEY`);
+const sender = process.env.BREVO_FROM_EMAIL || process.env.EMAIL_USER;
+console.log(`   ${sender ? "✓" : "–  not set (forgot-password emails won't send)"}  sender address (BREVO_FROM_EMAIL or EMAIL_USER)${sender ? `: ${sender}` : ""}`);
+console.log(`   ${process.env.PORT ? "✓" : "–"}  PORT ${process.env.PORT || "(not set: the server uses 3000)"}`);
 
 console.log("3. Loading the API");
 try {
