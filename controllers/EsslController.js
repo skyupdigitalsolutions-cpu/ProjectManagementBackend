@@ -56,6 +56,14 @@ const touchDevice = (serial, ip, extra = {}) => {
   ).catch((e) => console.error("[eSSL] device update failed:", e.message));
 };
 
+// "Ver 6.60 Apr 2 2019,19,25,2345,192.168.1.201,..." → { firmware, users, fingerprints, punches, ip }
+const parseDeviceInfo = (raw) => {
+  if (!raw) return null;
+  const p = String(raw).split(",").map((x) => x.trim());
+  const num = (v) => (/^\d+$/.test(v || "") ? Number(v) : null);
+  return { firmware: p[0] || "", users: num(p[1]), fingerprints: num(p[2]), punches: num(p[3]), ip: p[4] || "", raw: String(raw).slice(0, 200), at: new Date() };
+};
+
 // Parse "KEY=value\tKEY=value" (machine user lines) into an object.
 const parseKV = (line) => Object.fromEntries(
   line.replace(/^USER\s+/, "").split("\t").map((kv) => {
@@ -69,8 +77,10 @@ const storeMachineUsers = async (serial, rawBody) => {
   const users = [];
   for (const line of rawBody.split("\n")) {
     const t = line.trim();
-    if (!/^(USER\s+)?PIN=/i.test(t)) continue;
+    // "USER PIN=1\tName=…" (OPERLOG) or "PIN=1\tName=…" (USERINFO); skip FP/FACE templates
+    if (!/^(USER\s+)?PIN2?=/i.test(t)) continue;
     const kv = parseKV(t);
+    if (!kv.pin && kv.pin2) kv.pin = kv.pin2;
     if (!kv.pin) continue;
     users.push({ pin: String(kv.pin).trim(), name: kv.name || "", card: kv.card || "", privilege: kv.pri || kv.privilege || "" });
   }
@@ -514,7 +524,10 @@ const getRequest = async (req, res) => {
   try {
     const serial = req.query.SN;
     if (!serial) return res.send("OK");
-    await touchDevice(serial, req.ip);
+    // Most eSSL/ZK machines report their own totals on this call:
+    // INFO=firmware,users,fingerprints,punches,ip,... → lets the app show what's complete.
+    const info = parseDeviceInfo(req.query.INFO);
+    await touchDevice(serial, req.ip, info ? { info } : {});
     const dev = await EsslDevice.findOne({ serial: String(serial) });
     if (!dev) return res.send("OK");
     // Give up on requests the machine never answered within 30 min (its firmware may not support them)
@@ -576,7 +589,11 @@ const admsReceiver = async (req, res) => {
     const { SN: deviceSerial, table } = req.query;
 
     const rawBody =
-      typeof req.body === "string" ? req.body : req.body?.toString?.() || "";
+      typeof req.body === "string" ? req.body
+      : Buffer.isBuffer(req.body) ? req.body.toString("utf8")
+      : req.body && typeof req.body === "object" && Object.keys(req.body).length
+        ? Object.entries(req.body).map(([k, v]) => (v === "" ? k : `${k}=${v}`)).join("&") // form-parsed: rebuild
+        : "";
 
     console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
 
