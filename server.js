@@ -68,14 +68,18 @@ app.use((req, res, next) => {
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan('dev'));
+// ─── Fingerprint machine bodies: read as RAW TEXT, BEFORE the JSON/form parsers ──
+// The machine sends plain-text lines (punches, users with fingerprint templates).
+// 1) It must not go through express.urlencoded first: some firmware labels the
+//    upload as form data, and the form parser would swallow the lines.
+// 2) A full user list or punch history is far bigger than the 100 KB default.
+const deviceText = express.text({ type: () => true, limit: '25mb' });
+app.use('/iclock', deviceText);
+app.use('/api/essl/iclock', deviceText);
+
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-app.use('/iclock/cdata',          express.text({ type: '*/*' }));
-app.use('/iclock/cdata.aspx',     express.text({ type: '*/*' }));
-app.use('/api/essl/iclock/cdata', express.text({ type: '*/*' }));
-app.use('/iclock/devicecmd',      express.text({ type: 'text/*' }));
-app.use('/iclock/devicecmd.aspx', express.text({ type: 'text/*' }));
 
 app.get('/iclock/cdata',      admsHandshake);
 app.post('/iclock/cdata',     admsReceiver);
@@ -91,7 +95,6 @@ app.post('/iclock/devicecmd.aspx', deviceCmd);
 
 // Any other /iclock call from the machine (different firmware paths): log it and
 // answer OK instead of 404, so nothing the machine sends is silently lost.
-app.use('/iclock', express.text({ type: '*/*' }));
 app.all(/^\/iclock\//, unknownDeviceCall);
 
 const path = require('path');
