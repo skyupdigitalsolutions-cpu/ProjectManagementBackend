@@ -349,6 +349,11 @@ const setUserIds = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) throw new HttpError(400, "Invalid user id");
     const user = await User.findById(req.params.id);
     if (!user) throw new HttpError(404, "User not found");
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name || "").trim().slice(0, 100);
+      if (!name) throw new HttpError(400, "Name can't be empty");
+      user.name = name;
+    }
     for (const field of ["employee_id", "fingerprint_id"]) {
       if (req.body?.[field] === undefined) continue;
       const value = String(req.body[field] ?? "").trim();
@@ -728,6 +733,8 @@ const getMachine = async (req, res) => {
         serial: d.serial, last_seen: d.last_seen, online: d.last_seen && now - new Date(d.last_seen) < 3 * 60 * 1000,
         last_ip: d.last_ip, last_punches_at: d.last_punches_at, last_punches_count: d.last_punches_count,
         users_count: (d.users || []).length, users_updated_at: d.users_updated_at,
+        info: d.info?.at ? { firmware: d.info.firmware, users: d.info.users, fingerprints: d.info.fingerprints, punches: d.info.punches, ip: d.info.ip, at: d.info.at } : null,
+        users_missing: d.info?.users != null ? Math.max(0, d.info.users - (d.users || []).length) : null,
         // Waiting requests always; finished ones only for 10 minutes after they finished
         commands: (d.commands || []).filter((c) => !["done", "failed"].includes(c.status) || c.done_at && now - new Date(c.done_at) < 10 * 60 * 1000)
           .slice(-6).reverse(),
@@ -825,7 +832,9 @@ const createEmployeesFromMachine = async (req, res) => {
     const items = Array.isArray(b.items) ? b.items : [];
     if (!items.length) throw new HttpError(400, "Choose at least one person from the machine");
     if (items.length > 200) throw new HttpError(400, "At most 200 people at once");
-    const department = String(b.department || "").trim(), designation = String(b.designation || "").trim();
+    // quick: just a name for a machine number (attendance only). No email, default department/designation.
+    if (b.quick) { b.no_email_ok = true; }
+    const department = String(b.department || (b.quick ? "General" : "")).trim(), designation = String(b.designation || (b.quick ? "Staff" : "")).trim();
     if (!department) throw new HttpError(400, "Choose a department");
     if (!designation) throw new HttpError(400, "Enter a designation");
     const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
