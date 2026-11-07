@@ -349,6 +349,13 @@ const setUserIds = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) throw new HttpError(400, "Invalid user id");
     const user = await User.findById(req.params.id);
     if (!user) throw new HttpError(404, "User not found");
+    if (req.body?.email !== undefined) {
+      const email = String(req.body.email || "").trim().toLowerCase();
+      if (!EMAIL_RE.test(email) || isPlaceholderEmail(email)) throw new HttpError(400, "Enter a valid email");
+      const clash = await User.findOne({ email, _id: { $ne: user._id } }).select("name").lean();
+      if (clash) throw new HttpError(409, `Email already used by ${clash.name}`);
+      user.email = email;
+    }
     if (req.body?.name !== undefined) {
       const name = String(req.body.name || "").trim().slice(0, 100);
       if (!name) throw new HttpError(400, "Name can't be empty");
@@ -363,6 +370,9 @@ const setUserIds = async (req, res) => {
         if (clash) throw new HttpError(409, `${field === "employee_id" ? "Employee ID" : "Device ID"} "${value}" already belongs to ${clash.name}`);
       }
       user[field] = value || (field === "employee_id" ? undefined : null);
+    }
+    if (user.fingerprint_id && !hasRealEmail(user)) {
+      throw new HttpError(400, `Add an email for ${user.name} first: an email is required to link attendance.`);
     }
     await user.save({ validateModifiedOnly: true });
     const imported = await importForUser(user);
@@ -383,6 +393,12 @@ async function importForUser(user) {
   }
   return out;
 }
+
+// Email is required to link anyone to the fingerprint machine. Placeholder
+// addresses (from the earlier "no email" option) don't count as an email.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isPlaceholderEmail = (e) => /@no-email\.invalid$/i.test(String(e || ""));
+const hasRealEmail = (u) => Boolean(u?.email) && EMAIL_RE.test(u.email) && !isPlaceholderEmail(u.email);
 
 const cleanId = (v) => {
   const value = String(v ?? "").trim();
@@ -414,7 +430,7 @@ const saveIds = async (req, res) => {
     const changes = Array.isArray(req.body?.changes) ? req.body.changes : [];
     if (!changes.length) throw new HttpError(400, "No changes to save");
     if (changes.length > 1000) throw new HttpError(400, "Too many changes at once");
-    const all = await User.find({}).select("name employee_id fingerprint_id").lean();
+    const all = await User.find({}).select("name email employee_id fingerprint_id").lean();
     const byId = new Map(all.map((u) => [String(u._id), { ...u }]));
     const touched = new Map();
     for (const c of changes) {
@@ -432,6 +448,9 @@ const saveIds = async (req, res) => {
         seen.set(u[f], u.name);
       }
     }
+    // An email is required to link someone to the fingerprint machine
+    const noEmail = [...touched.values()].filter((u) => u.fingerprint_id && !hasRealEmail(u)).map((u) => u.name);
+    if (noEmail.length) throw new HttpError(400, `Add an email first (required to link attendance): ${noEmail.join(", ")}`);
     // Two steps so swaps don't trip the unique index: clear, then set.
     const ids = [...touched.keys()];
     await User.updateMany({ _id: { $in: ids } }, { $unset: { employee_id: "" }, $set: { fingerprint_id: null } });
@@ -832,8 +851,7 @@ const createEmployeesFromMachine = async (req, res) => {
     const items = Array.isArray(b.items) ? b.items : [];
     if (!items.length) throw new HttpError(400, "Choose at least one person from the machine");
     if (items.length > 200) throw new HttpError(400, "At most 200 people at once");
-    // quick: just a name for a machine number (attendance only). No email, default department/designation.
-    if (b.quick) { b.no_email_ok = true; }
+    // quick: name + email for a machine number; default department/designation. Email is always required.
     const department = String(b.department || (b.quick ? "General" : "")).trim(), designation = String(b.designation || (b.quick ? "Staff" : "")).trim();
     if (!department) throw new HttpError(400, "Choose a department");
     if (!designation) throw new HttpError(400, "Enter a designation");
@@ -855,12 +873,8 @@ const createEmployeesFromMachine = async (req, res) => {
       if (devIds.has(pin)) return bad(`Device ID ${pin} already belongs to ${devIds.get(pin)}`);
       if (seen.pin.has(pin)) return bad("This machine number is listed twice");
       if (!name) return bad("Enter a name");
-      if (!email) {
-        if (!b.no_email_ok) return bad("Enter an email (or allow people without email)");
-        email = `device-${pin}@no-email.invalid`; // attendance-only staff; can't sign in until a real email is set
-        r.email = email; r.no_email = true;
-      }
-      if (!EMAIL.test(email)) return bad("Email doesn't look right");
+      if (!email) return bad("Enter an email (required to link attendance)");
+      if (!EMAIL.test(email) || isPlaceholderEmail(email)) return bad("Email doesn't look right");
       if (emails.has(email)) return bad(`Email already used by ${emails.get(email)}`);
       if (seen.email.has(email)) return bad("This email is listed twice");
       if (employee_id && empIds.has(employee_id)) return bad(`Employee ID ${employee_id} already belongs to ${empIds.get(employee_id)}`);
@@ -889,7 +903,7 @@ const createEmployeesFromMachine = async (req, res) => {
           fingerprint_id: r.pin, ...(r.employee_id ? { employee_id: r.employee_id } : {}),
         });
         r.user_id = user._id;
-        if (!r.no_email) r.temporary_password = password; // shown once to the admin
+        r.temporary_password = password; // shown once to the admin
         const imp = await importUnmatchedPunches(r.pin, user).catch(() => ({ punches: 0 }));
         r.imported_punches = imp.punches || 0;
         created++;
