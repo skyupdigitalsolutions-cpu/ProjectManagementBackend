@@ -64,6 +64,13 @@ async function loadPolicy() {
   };
 }
 
+// Who appears in the day view and the monthly register: everyone active except
+// admins, unless the admin has a Device ID (they punch in like anyone else).
+const TRACKED_USERS = {
+  status: { $ne: "inactive" },
+  $or: [{ role: { $ne: "admin" } }, { fingerprint_id: { $exists: true, $nin: ["", null] } }],
+};
+
 // ─── One day for one person ──────────────────────────────────────────────────
 const SUMMARY_USER = "name email department designation role status employee_id fingerprint_id work_mode joining_date createdAt";
 
@@ -251,7 +258,7 @@ const getDay = async (req, res) => {
   try {
     const date = parseYmd(req.query.date || todayIst(), "date");
     const pol = await loadPolicy();
-    const users = await User.find({ status: { $ne: "inactive" }, role: { $ne: "admin" } }).select(SUMMARY_USER).sort({ name: 1 }).lean();
+    const users = await User.find(TRACKED_USERS).select(SUMMARY_USER).sort({ name: 1 }).lean();
     const { recMap, leaveMap } = await loadRange(users.map((u) => u._id), date, date);
     const off = pol.weeklyOffs.includes(weekday(date)) || pol.holidays.has(date);
     const today = todayIst();
@@ -302,7 +309,7 @@ const getRegister = async (req, res) => {
     const from = `${m[1]}-${m[2]}-01`;
     const to = new Date(Date.UTC(+m[1], +m[2], 0)).toISOString().slice(0, 10);
     const pol = await loadPolicy();
-    const users = await User.find({ status: { $ne: "inactive" }, role: { $ne: "admin" } }).select(SUMMARY_USER).sort({ name: 1 }).lean();
+    const users = await User.find(TRACKED_USERS).select(SUMMARY_USER).sort({ name: 1 }).lean();
     const { recMap, leaveMap } = await loadRange(users.map((u) => u._id), from, to);
     const data = users.map((u) => ({
       user: u,
@@ -349,8 +356,8 @@ const setUserIds = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) throw new HttpError(400, "Invalid user id");
     const user = await User.findById(req.params.id);
     if (!user) throw new HttpError(404, "User not found");
-    if (req.body?.email !== undefined) {
-      const email = String(req.body.email || "").trim().toLowerCase();
+    if (req.body?.email !== undefined && String(req.body.email || "").trim()) {
+      const email = String(req.body.email).trim().toLowerCase();
       if (!EMAIL_RE.test(email) || isPlaceholderEmail(email)) throw new HttpError(400, "Enter a valid email");
       const clash = await User.findOne({ email, _id: { $ne: user._id } }).select("name").lean();
       if (clash) throw new HttpError(409, `Email already used by ${clash.name}`);
@@ -370,9 +377,6 @@ const setUserIds = async (req, res) => {
         if (clash) throw new HttpError(409, `${field === "employee_id" ? "Employee ID" : "Device ID"} "${value}" already belongs to ${clash.name}`);
       }
       user[field] = value || (field === "employee_id" ? undefined : null);
-    }
-    if (user.fingerprint_id && !hasRealEmail(user)) {
-      throw new HttpError(400, `Add an email for ${user.name} first: an email is required to link attendance.`);
     }
     await user.save({ validateModifiedOnly: true });
     const imported = await importForUser(user);
@@ -394,7 +398,7 @@ async function importForUser(user) {
   return out;
 }
 
-// Email is required to link anyone to the fingerprint machine. Placeholder
+// Email is optional. Placeholder
 // addresses (from the earlier "no email" option) don't count as an email.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isPlaceholderEmail = (e) => /@no-email\.invalid$/i.test(String(e || ""));
@@ -448,9 +452,6 @@ const saveIds = async (req, res) => {
         seen.set(u[f], u.name);
       }
     }
-    // An email is required to link someone to the fingerprint machine
-    const noEmail = [...touched.values()].filter((u) => u.fingerprint_id && !hasRealEmail(u)).map((u) => u.name);
-    if (noEmail.length) throw new HttpError(400, `Add an email first (required to link attendance): ${noEmail.join(", ")}`);
     // Two steps so swaps don't trip the unique index: clear, then set.
     const ids = [...touched.keys()];
     await User.updateMany({ _id: { $in: ids } }, { $unset: { employee_id: "" }, $set: { fingerprint_id: null } });
@@ -851,7 +852,7 @@ const createEmployeesFromMachine = async (req, res) => {
     const items = Array.isArray(b.items) ? b.items : [];
     if (!items.length) throw new HttpError(400, "Choose at least one person from the machine");
     if (items.length > 200) throw new HttpError(400, "At most 200 people at once");
-    // quick: name + email for a machine number; default department/designation. Email is always required.
+    // quick: name + email for a machine number; default department/designation. Email is optional (attendance-only staff get a placeholder address and cannot sign in).
     const department = String(b.department || (b.quick ? "General" : "")).trim(), designation = String(b.designation || (b.quick ? "Staff" : "")).trim();
     if (!department) throw new HttpError(400, "Choose a department");
     if (!designation) throw new HttpError(400, "Enter a designation");
@@ -873,10 +874,15 @@ const createEmployeesFromMachine = async (req, res) => {
       if (devIds.has(pin)) return bad(`Device ID ${pin} already belongs to ${devIds.get(pin)}`);
       if (seen.pin.has(pin)) return bad("This machine number is listed twice");
       if (!name) return bad("Enter a name");
-      if (!email) return bad("Enter an email (required to link attendance)");
-      if (!EMAIL.test(email) || isPlaceholderEmail(email)) return bad("Email doesn't look right");
-      if (emails.has(email)) return bad(`Email already used by ${emails.get(email)}`);
-      if (seen.email.has(email)) return bad("This email is listed twice");
+      if (!email) {
+        // No email: attendance only. A unique placeholder keeps the user record valid; they can't sign in.
+        do { email = `device-${pin}-${Math.random().toString(36).slice(2, 6)}@no-email.invalid`; } while (emails.has(email) || seen.email.has(email));
+        r.email = email; r.no_email = true;
+      } else {
+        if (!EMAIL.test(email) || isPlaceholderEmail(email)) return bad("Email doesn't look right");
+        if (emails.has(email)) return bad(`Email already used by ${emails.get(email)}`);
+        if (seen.email.has(email)) return bad("This email is listed twice");
+      }
       if (employee_id && empIds.has(employee_id)) return bad(`Employee ID ${employee_id} already belongs to ${empIds.get(employee_id)}`);
       if (employee_id && seen.emp.has(employee_id)) return bad("This Employee ID is listed twice");
       seen.pin.add(pin); seen.email.add(email); if (employee_id) seen.emp.add(employee_id);
@@ -903,7 +909,7 @@ const createEmployeesFromMachine = async (req, res) => {
           fingerprint_id: r.pin, ...(r.employee_id ? { employee_id: r.employee_id } : {}),
         });
         r.user_id = user._id;
-        r.temporary_password = password; // shown once to the admin
+        if (!r.no_email) r.temporary_password = password; // shown once to the admin
         const imp = await importUnmatchedPunches(r.pin, user).catch(() => ({ punches: 0 }));
         r.imported_punches = imp.punches || 0;
         created++;
