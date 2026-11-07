@@ -54,6 +54,16 @@ const EsslDeviceSchema = new mongoose.Schema(
     resend_all_sent_at: { type: Date, default: null },
     // Calls from the machine to /iclock paths the server doesn't know (for diagnosis)
     unknown_calls: { type: [String], default: [] },
+    // What the machine reports about itself (GET /iclock/getrequest?INFO=...)
+    info: {
+      firmware: { type: String, default: "" },
+      users: { type: Number, default: null },
+      fingerprints: { type: Number, default: null },
+      punches: { type: Number, default: null },
+      ip: { type: String, default: "" },
+      raw: { type: String, default: "" },
+      at: { type: Date, default: null },
+    },
   },
   { timestamps: true, collection: "essl_devices" }
 );
