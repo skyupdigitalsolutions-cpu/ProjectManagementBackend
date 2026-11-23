@@ -13,6 +13,16 @@ const shieldops = ShieldOps.init({
   enabled,
 });
 
+// Monitoring must never break the app. SDK 0.2.0 leaves `security` undefined when the key or
+// endpoint is missing, which crashed login; fill in harmless no-ops so every call is always safe.
+const noop = () => {};
+const SECURITY_EVENTS = ['loginSucceeded', 'loginFailed', 'logout', 'mfaFailed', 'passwordReset', 'accessDenied', 'rateLimited', 'adminAction', 'permissionChanged', 'inputRejected'];
+shieldops.security = shieldops.security || {};
+for (const name of SECURITY_EVENTS) if (typeof shieldops.security[name] !== 'function') shieldops.security[name] = noop;
+if (typeof shieldops.requestHandler !== 'function') shieldops.requestHandler = () => (req, res, next) => next();
+if (typeof shieldops.errorHandler !== 'function') shieldops.errorHandler = () => (err, req, res, next) => next(err);
+if (!enabled) console.warn('[shieldops] Monitoring is off: set SHIELDOPS_KEY and SHIELDOPS_ENDPOINT to turn it on.');
+
 /**
  * Forwards console output to ShieldOps:
  *  - every console line becomes a searchable log line (Logs page);
