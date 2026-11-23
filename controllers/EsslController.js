@@ -41,14 +41,120 @@
 const Attendance = require("../models/attendance");
 const User = require("../models/users");
 const { handleClockInAlert, handleClockOutAlert } = require("../services/attendanceAlerts");
+const rules = require("../services/attendanceRules");
+const UnmatchedPunch = require("../models/unmatchedPunch");
+const EsslDevice = require("../models/esslDevice");
+
+// ─── Machine tracking + command queue ────────────────────────────────────────
+// Remember each machine (by serial) and when it last called in.
+const touchDevice = (serial, ip, extra = {}) => {
+  if (!serial) return Promise.resolve();
+  return EsslDevice.updateOne(
+    { serial: String(serial) },
+    { $set: { last_seen: new Date(), last_ip: ip || "", ...extra } },
+    { upsert: true }
+  ).catch((e) => console.error("[eSSL] device update failed:", e.message));
+};
+
+// "Ver 6.60 Apr 2 2019,19,25,2345,192.168.1.201,..." → { firmware, users, fingerprints, punches, ip }
+const parseDeviceInfo = (raw) => {
+  if (!raw) return null;
+  const p = String(raw).split(",").map((x) => x.trim());
+  const num = (v) => (/^\d+$/.test(v || "") ? Number(v) : null);
+  return { firmware: p[0] || "", users: num(p[1]), fingerprints: num(p[2]), punches: num(p[3]), ip: p[4] || "", raw: String(raw).slice(0, 200), at: new Date() };
+};
+
+// Parse "KEY=value\tKEY=value" (machine user lines) into an object.
+const parseKV = (line) => Object.fromEntries(
+  line.replace(/^USER\s+/, "").split("\t").map((kv) => {
+    const i = kv.indexOf("=");
+    return i > 0 ? [kv.slice(0, i).trim().toLowerCase(), kv.slice(i + 1).trim()] : null;
+  }).filter(Boolean)
+);
+
+// Store the users the machine reports (table OPERLOG "USER PIN=..." or USERINFO "PIN=...").
+const storeMachineUsers = async (serial, rawBody) => {
+  const users = [];
+  for (const line of rawBody.split("\n")) {
+    const t = line.trim();
+    // "USER PIN=1\tName=…" (OPERLOG) or "PIN=1\tName=…" (USERINFO); skip FP/FACE templates
+    if (!/^(USER\s+)?PIN2?=/i.test(t)) continue;
+    const kv = parseKV(t);
+    if (!kv.pin && kv.pin2) kv.pin = kv.pin2;
+    if (!kv.pin) continue;
+    users.push({ pin: String(kv.pin).trim(), name: kv.name || "", card: kv.card || "", privilege: kv.pri || kv.privilege || "" });
+  }
+  if (!users.length) return 0;
+  const dev = (await EsslDevice.findOne({ serial: String(serial) })) || new EsslDevice({ serial: String(serial) });
+  const byPin = new Map(dev.users.map((u) => [u.pin, u]));
+  for (const u of users) byPin.set(u.pin, u); // update / add (the machine may send the list in parts)
+  dev.users = [...byPin.values()].sort((a, b) => a.pin.localeCompare(b.pin, undefined, { numeric: true }));
+  dev.users_updated_at = new Date();
+  await dev.save();
+  console.log(`[eSSL] 👥 ${users.length} user(s) received from machine ${serial} (${dev.users.length} known)`);
+  return users.length;
+};
+
+/**
+ * Many machines send the requested data but never post a separate confirmation
+ * to /iclock/devicecmd. So when punches or users arrive, mark the matching
+ * waiting request(s) as done, with what the machine sent.
+ */
+const completeCommands = async (serial, kind, result) => {
+  try {
+    const dev = await EsslDevice.findOne({ serial: String(serial) });
+    if (!dev) return;
+    const match = (c) => c.status === "sent" && (kind === "ATTLOG"
+      ? c.cmd.startsWith("DATA QUERY ATTLOG") || c.cmd === "CHECK"
+      : c.cmd.startsWith("DATA QUERY USERINFO") || c.cmd === "CHECK");
+    let n = 0;
+    for (const c of dev.commands) if (match(c)) { Object.assign(c, { status: "done", result, done_at: new Date() }); n++; }
+    if (n) { await dev.save(); console.log(`[eSSL] ✅ ${n} request(s) for ${serial} completed by data: ${result}`); }
+  } catch (e) { console.error("[eSSL] completeCommands:", e.message); }
+};
+
+/** Ask a machine to upload everything again (older-firmware method), then make it reconnect. */
+const requestFullUpload = async (serial, by = "") => {
+  await EsslDevice.updateOne({ serial: String(serial) },
+    { $set: { resend_all: true, resend_all_requested_at: new Date(), resend_all_sent_at: null } });
+  // CHECK makes most machines re-read the server options right away (the reconnect above)
+  return queueDeviceCommand(serial, "CHECK", "Upload everything again (older method)", by);
+};
+
+/** Any other /iclock call from the machine: log it, remember it, answer OK. */
+const unknownDeviceCall = async (req, res) => {
+  const serial = req.query.SN;
+  const what = `${req.method} ${req.path} ${JSON.stringify(req.query)} ${typeof req.body === "string" ? req.body.slice(0, 120) : ""}`.trim();
+  console.log(`[eSSL] ❓ Unknown machine call: ${what}`);
+  if (serial) {
+    EsslDevice.updateOne({ serial: String(serial) }, { $push: { unknown_calls: { $each: [`${new Date().toISOString()} ${what}`], $slice: -20 } } }).catch(() => {});
+  }
+  res.set("Content-Type", "text/plain");
+  res.send("OK");
+};
+
+/** Queue a command for a machine (picked up on its next poll). Used by the admin app. */
+const queueDeviceCommand = async (serial, cmd, label, by = "") => {
+  const dev = await EsslDevice.findOne({ serial: String(serial) });
+  if (!dev) throw new Error(`Machine ${serial} hasn't contacted the server yet`);
+  // Same request already waiting? Don't pile up duplicates.
+  const pending = dev.commands.find((c) => c.cmd === cmd && (c.status === "queued" || c.status === "sent"));
+  if (pending) return pending.id;
+  const id = dev.next_cmd_id || 1;
+  dev.next_cmd_id = id + 1;
+  dev.commands.push({ id, cmd, label, created_by: by });
+  if (dev.commands.length > 50) dev.commands = dev.commands.slice(-50);
+  await dev.save();
+  return id;
+};
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
-const toMidnight = (date = new Date()) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
+// FIX: the day a record belongs to is the IST calendar day, stored as 00:00 IST
+// (same convention as Attendancecontroller). d.setHours(0,0,0,0) used the
+// server's midnight, so on a UTC/CET server these records never matched the
+// attendance controller's queries. See services/attendanceRules.js.
+const toMidnight = (date = new Date()) => rules.istDayStart(date);
 
 // Punches closer together than this are treated as ONE punch (device re-sends,
 // employee re-taps because it didn't beep, etc.). 10 minutes is far below any
@@ -108,12 +214,10 @@ const istMinutes = (date) => {
 const calcHours = (clockIn, clockOut) =>
   Math.round(((clockOut - clockIn) / (1000 * 60 * 60)) * 100) / 100;
 
-// Half-day if worked < 4h; late if the first punch is after 09:15 IST.
-const deriveStatus = (clockIn, workedHours = null) => {
-  if (workedHours != null && workedHours < 4) return "half-day";
-  if (istMinutes(clockIn) > 9 * 60 + 15) return "late";
-  return "present";
-};
+// FIX: status follows the ACTIVE Policy (work start + late grace, half-day
+// hours, weekly offs, holidays) instead of a hard-coded 09:15 / 4 h.
+// upsertAttendanceFromPunches() loads the policy before calling this.
+const deriveStatus = (clockIn, workedHours = null) => rules.deriveStatus(clockIn, workedHours);
 
 // Would this trailing punch, given the current time, count as end-of-day?
 const isEndOfDayPunch = (punchTime, now = new Date()) => {
@@ -180,33 +284,50 @@ const deriveFromDistinct = (distinct, now = new Date()) => {
  * clock_in / clock_out using the pairs + end-of-day model described up top.
  */
 const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial) => {
+  await rules.loadRules(); // current policy for deriveStatus (cached 60 s)
   const userId = user._id;
   const date = toMidnight(dateObj);
 
   // 1. Load punches already stored for this user/day (full-day picture).
-  const existing = await Attendance.findOne({ user_id: userId, date });
-  const priorLogs = existing?.raw_logs || [];
+  //    FIX: look across the whole IST day, not one exact date value. Records
+  //    saved by the old code sit at a different midnight; without this, a day
+  //    got split in two (morning punch in one record, evening punch in another)
+  //    and both showed "punched in, no punch out". All punches are merged into
+  //    one record and the split copies are removed.
+  const dayRecs = await Attendance.find({ user_id: userId, date: rules.istDayRange(date) }).sort({ createdAt: 1 });
+  const existing =
+    dayRecs.find((r) => r.admin_locked) ||           // an admin's marking wins
+    dayRecs.find((r) => +r.date === +date) ||        // already on the right midnight
+    dayRecs.find((r) => r.raw_logs?.length) ||
+    dayRecs[0] || null;
+  const splitCopies = dayRecs.filter((r) => r !== existing && (r.source === "fingerprint" || r.raw_logs?.length));
+  const priorLogs = [...(existing?.raw_logs || []), ...splitCopies.flatMap((r) => r.raw_logs || [])];
 
-  // 2. Merge prior + incoming punches.
+  // 2. Merge prior + incoming punches. Incoming first, so when the device
+  //    re-sends a punch the newly corrected copy wins over an older stored one.
   const incoming = punches.map((p) => ({
     time: new Date(p.time),
     type: String(p.type),
     verify: String(p.verify),
+    clock_offset_applied: Number(p.clock_offset_applied) || 0,
   }));
   const merged = [
+    ...incoming,
     ...priorLogs.map((l) => ({
       time: new Date(l.time),
       type: String(l.type),
       verify: String(l.verify),
+      ...(l.clock_offset_applied != null && { clock_offset_applied: l.clock_offset_applied }),
     })),
-    ...incoming,
   ];
 
-  // 3. De-duplicate by exact timestamp (the device re-sends the same punches).
+  // 3. De-duplicate (the device re-sends the same punches). Compare on the
+  //    machine's own clock reading — stored time minus the correction it got —
+  //    so a re-sent punch never appears twice, corrected and uncorrected.
   const seen = new Set();
   const allPunches = [];
   for (const p of merged) {
-    const key = p.time.getTime();
+    const key = p.time.getTime() - (Number(p.clock_offset_applied) || 0) * 60 * 1000;
     if (Number.isNaN(key) || seen.has(key)) continue;
     seen.add(key);
     allPunches.push(p);
@@ -231,10 +352,11 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
     deriveFromDistinct(distinct, new Date());
 
   // 7. Save the full deduped set with $set (NOT $push — avoids duplicate pile-up).
-  const record = await Attendance.findOneAndUpdate(
-    { user_id: userId, date },
-    {
-      $set: {
+  //    If an admin marked this day (admin_locked), keep their times/status/source
+  //    and only log the punches.
+  const update = existing?.admin_locked
+    ? { raw_logs: allPunches, device_serial: deviceSerial || null }
+    : {
         clock_in,
         clock_out,
         hours_worked,
@@ -243,10 +365,18 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
         source: "fingerprint",
         device_serial: deviceSerial || null,
         raw_logs: allPunches,
-      },
+      };
+  const record = await Attendance.findOneAndUpdate(
+    existing ? { _id: existing._id } : { user_id: userId, date },
+    {
+      $set: { ...update, date }, // always stored at 00:00 IST
     },
     { upsert: true, returnDocument: "after", runValidators: true }
   );
+  if (splitCopies.length) {
+    await Attendance.deleteMany({ _id: { $in: splitCopies.map((r) => r._id) } });
+    console.log(`[eSSL] Merged ${splitCopies.length} split record(s) for ${user.name} on ${rules.istDateKey(date)}`);
+  }
 
   // ─── Fire attendance alerts on state transitions ─────────────────────────
   // Login ping: only when this is the first punch of the day (record is new).
@@ -262,11 +392,82 @@ const upsertAttendanceFromPunches = async (user, dateObj, punches, deviceSerial)
   return record;
 };
 
+// ─── Who does a punch belong to? ─────────────────────────────────────────────
+// The machine sends its own user number for every punch ("Device ID").
+// 1st: the user whose fingerprint_id equals it.
+// 2nd: if nobody has that fingerprint_id, the user whose employee_id equals it
+//      (for machines enrolled with employee codes). Email is never used.
+const findUsersForDeviceIds = async (ids) => {
+  const list = [...new Set(ids.map((x) => String(x).trim()).filter(Boolean))];
+  const users = await User.find({ $or: [{ fingerprint_id: { $in: list } }, { employee_id: { $in: list } }] });
+  const byFp = new Map(), byEmp = new Map();
+  for (const u of users) {
+    if (u.fingerprint_id) byFp.set(String(u.fingerprint_id).trim(), u);
+    if (u.employee_id) byEmp.set(String(u.employee_id).trim(), u);
+  }
+  const map = new Map();
+  for (const id of list) {
+    const u = byFp.get(id) || byEmp.get(id);
+    if (u) map.set(id, u);
+  }
+  return map;
+};
+
+// ─── Punches nobody owns yet ─────────────────────────────────────────────────
+// Kept (instead of dropped) until an admin assigns the Device ID to someone.
+const keepUnmatched = async (deviceId, punches, deviceSerial) => {
+  try {
+    if (!punches.length) return;
+    const times = punches.map((p) => new Date(p.time)).sort((a, b) => a - b);
+    const doc = (await UnmatchedPunch.findOne({ device_id: deviceId })) || new UnmatchedPunch({ device_id: deviceId, first_seen: times[0] });
+    const known = new Set(doc.punches.map((p) => +new Date(p.time) - (p.clock_offset_applied || 0) * 60000));
+    for (const p of punches) {
+      const key = +new Date(p.time) - (Number(p.clock_offset_applied) || 0) * 60000;
+      if (known.has(key)) continue; // device re-sent it
+      known.add(key);
+      doc.punches.push({ time: p.time, type: p.type, verify: p.verify, clock_offset_applied: p.clock_offset_applied, device_serial: deviceSerial || null });
+      doc.count += 1;
+    }
+    doc.punches.sort((a, b) => a.time - b.time);
+    if (doc.punches.length > UnmatchedPunch.MAX_KEPT) doc.punches = doc.punches.slice(-UnmatchedPunch.MAX_KEPT);
+    if (!doc.first_seen || times[0] < doc.first_seen) doc.first_seen = times[0];
+    if (!doc.last_seen || times[times.length - 1] > doc.last_seen) doc.last_seen = times[times.length - 1];
+    await doc.save();
+  } catch (err) {
+    console.error(`[eSSL] could not keep unmatched punches for Device ID ${deviceId}:`, err.message);
+  }
+};
+
+/**
+ * Imports the kept punches of `deviceId` into `user`'s attendance (grouped by
+ * IST day, same processing as live punches) and forgets them.
+ * Returns { punches, days }.
+ */
+const importUnmatchedPunches = async (deviceId, user) => {
+  const doc = await UnmatchedPunch.findOne({ device_id: String(deviceId).trim() });
+  if (!doc || !doc.punches.length) return { punches: 0, days: 0 };
+  const byDay = new Map();
+  for (const p of doc.punches) {
+    const day = rules.istDateKey(p.time);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push({ time: p.time, type: p.type, verify: p.verify, clock_offset_applied: p.clock_offset_applied });
+  }
+  for (const [day, punches] of byDay) {
+    await upsertAttendanceFromPunches(user, rules.istDayStart(day), punches, doc.punches[0].device_serial);
+  }
+  const n = doc.punches.length;
+  await doc.deleteOne();
+  console.log(`[eSSL] Imported ${n} earlier punches of Device ID ${deviceId} into ${user.name} (${byDay.size} days)`);
+  return { punches: n, days: byDay.size };
+};
+
 // ─── METHOD 1: ADMS PUSH RECEIVER ────────────────────────────────────────────
 
 const admsHandshake = async (req, res) => {
   try {
     const { SN } = req.query;
+    await touchDevice(SN, req.ip, { last_handshake_at: new Date(), last_handshake_query: JSON.stringify(req.query).slice(0, 400) });
+    const dev = SN ? await EsslDevice.findOne({ serial: String(SN) }).catch(() => null) : null;
     console.log(`[eSSL] ✅ Device handshake — Serial: ${SN} | IP: ${req.ip} | Query: ${JSON.stringify(req.query)} | TIME_SYNC=${TIME_SYNC}`);
 
     // Base options. TransTimes/TransFlag/Realtime tell the device WHAT and WHEN
@@ -300,6 +501,14 @@ const admsHandshake = async (req, res) => {
     // "off" (default): send neither TimeZone nor Date. The device keeps the
     // correct local time from its own Time Zone menu and is never overridden.
 
+    // "Upload everything again": stamps of 0 make the machine re-send its whole
+    // attendance log and its users (operation log). Works on old and new firmware.
+    if (dev?.resend_all) {
+      options.push("ATTLOGStamp=0", "OPERLOGStamp=0");
+      await EsslDevice.updateOne({ _id: dev._id }, { $set: { resend_all_sent_at: new Date() } });
+      console.log(`[eSSL] 🔁 Asked machine ${SN} to upload ALL punches and users again (stamps reset)`);
+    }
+
     res.set("Content-Type", "text/plain");
     res.send(options.join("\n") + "\n");
   } catch (err) {
@@ -308,9 +517,71 @@ const admsHandshake = async (req, res) => {
   }
 };
 
-const getRequest = (req, res) => {
+// The machine polls this every few seconds. Answer with the next queued command
+// ("C:<id>:<command>") or "OK" when there's nothing to do.
+const getRequest = async (req, res) => {
   res.set("Content-Type", "text/plain");
-  res.send("OK");
+  try {
+    const serial = req.query.SN;
+    if (!serial) return res.send("OK");
+    // Most eSSL/ZK machines report their own totals on this call:
+    // INFO=firmware,users,fingerprints,punches,ip,... → lets the app show what's complete.
+    const info = parseDeviceInfo(req.query.INFO);
+    await touchDevice(serial, req.ip, info ? { info } : {});
+    const dev = await EsslDevice.findOne({ serial: String(serial) });
+    if (!dev) return res.send("OK");
+    // Give up on requests the machine never answered within 30 min (its firmware may not support them)
+    let changed = false;
+    for (const c of dev.commands) {
+      if (c.status === "sent" && c.sent_at && Date.now() - c.sent_at > 30 * 60 * 1000) {
+        Object.assign(c, { status: "failed", result: "No reply from the machine", done_at: new Date() });
+        changed = true;
+      }
+    }
+    // Next queued command; or retry once a command sent 10+ min ago that got no data back
+    const stale = Date.now() - 10 * 60 * 1000;
+    const next = dev.commands.find((c) => c.status === "queued") ||
+      dev.commands.find((c) => c.status === "sent" && c.sent_at < stale && !c.result && (c.attempts || 1) < 2 && c.cmd !== "REBOOT");
+    if (!next) { if (changed) await dev.save(); return res.send("OK"); }
+    next.status = "sent";
+    next.sent_at = new Date();
+    next.attempts = (next.attempts || 0) + 1;
+    await dev.save();
+    console.log(`[eSSL] 📤 Command ${next.id} → ${serial}: ${next.cmd.replace(/\t/g, " ")}`);
+    return res.send(`C:${next.id}:${next.cmd}\n`);
+  } catch (err) {
+    console.error("[eSSL] getrequest error:", err.message);
+    return res.send("OK");
+  }
+};
+
+// The machine confirms commands here: body lines like "ID=3&Return=0&CMD=DATA".
+const deviceCmd = async (req, res) => {
+  res.set("Content-Type", "text/plain");
+  try {
+    const serial = req.query.SN;
+    // Body is "ID=3&Return=0&CMD=DATA" lines (text), or already parsed into an object
+    // when the machine sends it form-encoded.
+    const answers = typeof req.body === "string"
+      ? req.body.split(/\n/).map((line) => Object.fromEntries(line.trim().split("&").map((p) => p.split("=")).filter((x) => x.length === 2)))
+      : req.body && typeof req.body === "object" ? [req.body] : [];
+    const dev = serial && (await EsslDevice.findOne({ serial: String(serial) }));
+    if (dev) {
+      for (const q of answers) {
+        const c = dev.commands.find((x) => String(x.id) === String(q.ID));
+        if (!c) continue;
+        const ret = Number(q.Return);
+        c.status = Number.isFinite(ret) && ret < 0 ? "failed" : "done";
+        c.result = `Return=${q.Return ?? "?"}`;
+        c.done_at = new Date();
+        console.log(`[eSSL] ✅ Machine ${serial} answered command ${c.id}: ${c.result}`);
+      }
+      await dev.save();
+    }
+  } catch (err) {
+    console.error("[eSSL] devicecmd error:", err.message);
+  }
+  return res.send("OK");
 };
 
 const admsReceiver = async (req, res) => {
@@ -318,10 +589,27 @@ const admsReceiver = async (req, res) => {
     const { SN: deviceSerial, table } = req.query;
 
     const rawBody =
-      typeof req.body === "string" ? req.body : req.body?.toString?.() || "";
+      typeof req.body === "string" ? req.body
+      : Buffer.isBuffer(req.body) ? req.body.toString("utf8")
+      : req.body && typeof req.body === "object" && Object.keys(req.body).length
+        ? Object.entries(req.body).map(([k, v]) => (v === "" ? k : `${k}=${v}`)).join("&") // form-parsed: rebuild
+        : "";
 
     console.log(`[eSSL] 📥 POST /iclock/cdata — Device: ${deviceSerial} | Table: ${table} | Body length: ${rawBody.length}`);
 
+    touchDevice(deviceSerial, req.ip);
+    // The full re-upload has started arriving: stop asking for it at every connection
+    if (table === "ATTLOG" || table === "OPERLOG") {
+      EsslDevice.updateOne({ serial: String(deviceSerial), resend_all: true, resend_all_sent_at: { $ne: null } },
+        { $set: { resend_all: false } }).catch(() => {});
+    }
+    if (table === "OPERLOG" || table === "USERINFO" || table === "OPLOG") {
+      const n = await storeMachineUsers(deviceSerial, rawBody).catch((e) => { console.error("[eSSL] users:", e.message); return 0; });
+      if (n) await completeCommands(deviceSerial, "USERS", `Machine sent ${n} user${n === 1 ? "" : "s"}`);
+      if (!n) console.log(`[eSSL] ⏭ ${table} from ${deviceSerial} (no user lines)`);
+      res.set("Content-Type", "text/plain");
+      return res.send("OK");
+    }
     if (table !== "ATTLOG") {
       console.log(`[eSSL] ⏭ Ignoring table: ${table} from device ${deviceSerial}`);
       res.set("Content-Type", "text/plain");
@@ -337,6 +625,7 @@ const admsReceiver = async (req, res) => {
 
     const lines = rawBody.trim().split("\n").filter(Boolean);
     const punchMap = new Map(); // key: "fingerprint_id::YYYY-MM-DD" → [punches]
+    const clockRules = await rules.loadRules(); // for the machine clock correction
 
     for (const line of lines) {
       const parts = line.trim().split(/\t|\s{2,}/);
@@ -344,10 +633,12 @@ const admsReceiver = async (req, res) => {
 
       const [fingerprintId, datetimeStr, typeCode = "0", verifyCode = "1"] = parts;
       // Device sends local IST time (TimeZone=5.5). Parse as IST -> correct UTC.
-      const punchTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
-      if (isNaN(punchTime)) continue;
+      const deviceTime = new Date(datetimeStr.trim().replace(" ", "T") + "+05:30");
+      if (isNaN(deviceTime)) continue;
+      // Machine clock correction from the Policy (e.g. +30 min when the machine runs behind)
+      const punchTime = rules.correctDeviceTime(deviceTime, clockRules);
 
-      const dateKey = punchTime.toISOString().slice(0, 10);
+      const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fingerprintId}::${dateKey}`;
 
       if (!punchMap.has(mapKey)) punchMap.set(mapKey, []);
@@ -356,14 +647,15 @@ const admsReceiver = async (req, res) => {
         time: punchTime,
         type: decodePunchType(typeCode),
         verify: decodeVerifyMethod(verifyCode),
+        clock_offset_applied: clockRules.deviceClockOffsetMinutes,
         dateKey,
       });
     }
 
     const fingerprintIds = [...new Set([...punchMap.keys()].map((k) => k.split("::")[0]))];
 
-    const users = await User.find({ fingerprint_id: { $in: fingerprintIds } });
-    const userByFpId = new Map(users.map((u) => [String(u.fingerprint_id), u]));
+    // Device ID → fingerprint_id first, then employee_id (see findUsersForDeviceIds)
+    const userByFpId = await findUsersForDeviceIds(fingerprintIds);
 
     const results = { saved: 0, skipped: 0, errors: [] };
 
@@ -372,7 +664,8 @@ const admsReceiver = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
-        console.warn(`[eSSL] ⚠️  No user with fingerprint_id="${fpId}" — punch skipped. Run PATCH /api/essl/assign-fingerprint to map this ID.`);
+        console.warn(`[eSSL] ⚠️  No user with Device ID (fingerprint_id) or Employee ID "${fpId}" — punch kept as unassigned. Assign it in the admin app (IDs).`);
+        await keepUnmatched(fpId, punches, deviceSerial);
         results.skipped++;
         continue;
       }
@@ -387,6 +680,8 @@ const admsReceiver = async (req, res) => {
       }
     }
 
+    touchDevice(deviceSerial, req.ip, { last_punches_at: new Date(), last_punches_count: lines.length });
+    await completeCommands(deviceSerial, "ATTLOG", `Machine sent ${lines.length} punch${lines.length === 1 ? "" : "es"}`);
     console.log(`[eSSL] Batch complete — saved:${results.saved} skipped:${results.skipped} errors:${results.errors.length}`);
 
     res.set("Content-Type", "text/plain");
@@ -434,11 +729,15 @@ const syncFromDevice = async (req, res) => {
     console.log(`[eSSL] Pulled ${logs.length} punch records from device`);
 
     const punchMap = new Map();
+    const clockRules = await rules.loadRules(); // for the machine clock correction
 
     for (const log of logs) {
       const fpId = String(log.deviceUserId);
-      const punchTime = new Date(log.recordTime);
-      const dateKey = punchTime.toISOString().slice(0, 10);
+      // FIX: node-zklib returns the device's IST wall-clock as SERVER-local time;
+      // re-read it as IST so it's correct on any server timezone.
+      // ...then apply the machine clock correction from the Policy.
+      const punchTime = rules.correctDeviceTime(rules.deviceLocalToInstant(log.recordTime), clockRules);
+      const dateKey = rules.istDateKey(punchTime); // FIX: IST day, not UTC day (punches before 05:30 IST were filed under the previous day)
       const mapKey = `${fpId}::${dateKey}`;
 
       if (!punchMap.has(mapKey)) punchMap.set(mapKey, []);
@@ -447,6 +746,7 @@ const syncFromDevice = async (req, res) => {
         time: punchTime,
         type: decodePunchType(log.inOutStatus),
         verify: "fingerprint",
+        clock_offset_applied: clockRules.deviceClockOffsetMinutes,
         dateKey,
       });
     }
@@ -454,8 +754,8 @@ const syncFromDevice = async (req, res) => {
     await zkInstance.disconnect();
 
     const fingerprintIds = [...new Set([...punchMap.keys()].map((k) => k.split("::")[0]))];
-    const users = await User.find({ fingerprint_id: { $in: fingerprintIds } });
-    const userByFpId = new Map(users.map((u) => [String(u.fingerprint_id), u]));
+    // Device ID → fingerprint_id first, then employee_id (see findUsersForDeviceIds)
+    const userByFpId = await findUsersForDeviceIds(fingerprintIds);
 
     const results = { saved: 0, skipped: 0, errors: [] };
 
@@ -464,6 +764,7 @@ const syncFromDevice = async (req, res) => {
       const user = userByFpId.get(fpId);
 
       if (!user) {
+        await keepUnmatched(fpId, punches, device_serial || ip);
         results.skipped++;
         continue;
       }
@@ -626,4 +927,11 @@ module.exports = {
   getFingerprintMap,
   getDeviceConfig,
   pingDevice,
+  // Used by scripts/fixAttendanceDates.js to re-derive stored days the same way.
+  importUnmatchedPunches,
+  deviceCmd,
+  queueDeviceCommand,
+  requestFullUpload,
+  unknownDeviceCall,
+  _internals: { deriveFromDistinct, PUNCH_MERGE_WINDOW_MS },
 };

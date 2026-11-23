@@ -69,6 +69,9 @@ const mailRoutes = require("./mailroutes");
 
 const productivityRoutes = require("./productivityRoutes");
 
+// ── Attendance PWA (read-only views over attendance, leave and policy) ───────
+const attendanceAppRoutes = require("./attendanceAppRoutes");
+
 // ── Mount routes ──────────────────────────────────────────────────────────────
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
@@ -94,5 +97,6 @@ router.use("/task-templates", taskTemplateRoutes);
 router.use("/employee-chat", employeeChatRoutes);
 router.use("/mail", mailRoutes);
 router.use("/productivity", productivityRoutes);
+router.use("/attendance-app", attendanceAppRoutes);
 
 module.exports = router;

@@ -5,6 +5,10 @@ const RawLogSchema = new mongoose.Schema(
     time: { type: Date },
     type: { type: String },   // wrapped so Mongoose treats "type" as a field, not a type declaration
     verify: { type: String },
+    // Minutes of machine-clock correction already added to `time`
+    // (Policy.device_clock_offset_minutes at the moment it was saved).
+    // Missing on punches saved before this existed = not corrected yet.
+    clock_offset_applied: { type: Number },
   },
   { _id: false }
 );
@@ -69,6 +73,23 @@ const AttendanceSchema = mongoose.Schema(
       type: String,
       default: null,               // serial number of the eSSL device that sent the record
     },
+
+    // ─── Admin marking (Attendance Admin app) ─────────────────────────────
+    // remark: a note an admin adds to the day (shown in the app and reports).
+    remark:         { type: String, trim: true, maxlength: 500, default: "" },
+    remark_by:      { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    remark_by_name: { type: String, default: null },
+    remark_at:      { type: Date, default: null },
+    // admin_locked: an admin set this day's status / times / work from home.
+    // Fingerprint punches are still logged in raw_logs, but never change the
+    // admin's clock_in, clock_out, hours, status or source.
+    admin_locked:   { type: Boolean, default: false },
+    // no_times: marked without a login time (e.g. work from home, absent).
+    // clock_in is required by this schema, so it holds 00:00 IST and is ignored.
+    no_times:       { type: Boolean, default: false },
+    marked_by:      { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    marked_by_name: { type: String, default: null },
+    marked_at:      { type: Date, default: null },
    raw_logs: {
       type: [RawLogSchema],
       default: [],

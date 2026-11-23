@@ -11,6 +11,7 @@
  */
 
 const Policy = require('../models/policy');
+const { invalidateRules } = require('../services/attendanceRules');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  getActivePolicy
@@ -80,6 +81,8 @@ const createPolicy = async (req, res) => {
       created_by: req.user._id,
     });
 
+    invalidateRules(); // new rules apply to the next punch
+
     return res.status(201).json({
       success: true,
       message: 'Policy created and set as active',
@@ -101,7 +104,16 @@ const updatePolicy = async (req, res) => {
     const { id } = req.params;
 
     // Prevent updating holidays via this endpoint (use dedicated endpoints below)
-    const { holidays, ...rest } = req.body;
+    const { holidays, device_clock_offset_since, ...rest } = req.body;
+
+    // Remember when the machine clock correction changes, so the repair script
+    // knows which stored punches were saved before the correction existed.
+    if (rest.device_clock_offset_minutes !== undefined) {
+      const current = await Policy.findById(id).select("device_clock_offset_minutes").lean();
+      if (current && Number(current.device_clock_offset_minutes || 0) !== Number(rest.device_clock_offset_minutes)) {
+        rest.device_clock_offset_since = new Date();
+      }
+    }
 
     const policy = await Policy.findByIdAndUpdate(
       id,
@@ -112,6 +124,8 @@ const updatePolicy = async (req, res) => {
     if (!policy) {
       return res.status(404).json({ success: false, message: 'Policy not found' });
     }
+
+    invalidateRules(); // new rules apply to the next punch
 
     return res.status(200).json({
       success: true,
@@ -161,6 +175,8 @@ const addHoliday = async (req, res) => {
     policy.holidays.sort((a, b) => new Date(a.date) - new Date(b.date));
     await policy.save();
 
+    invalidateRules(); // new rules apply to the next punch
+
     return res.status(201).json({
       success: true,
       message: `Holiday "${name}" added`,
@@ -200,6 +216,8 @@ const removeHoliday = async (req, res) => {
     }
 
     await policy.save();
+
+    invalidateRules(); // new rules apply to the next punch
 
     return res.status(200).json({
       success: true,
