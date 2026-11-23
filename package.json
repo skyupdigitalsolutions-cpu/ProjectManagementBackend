@@ -14,6 +14,7 @@
   "description": "",
   "dependencies": {
     "@getbrevo/brevo": "^5.0.4",
+    "@shieldops/node": "file:vendor/shieldops-node-0.2.0.tgz",
     "axios": "^1.14.0",
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.10.0",

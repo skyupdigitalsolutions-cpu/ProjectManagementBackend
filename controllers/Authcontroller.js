@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const User = require("../models/users");
+const shieldops = require("../config/shieldops");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -73,22 +74,31 @@ const login = async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
+    // Reject anything but plain text: an object here (for example {"$gt": ""}) is an injection attempt.
+    if (typeof email !== "string" || typeof password !== "string") {
+      return res.status(400).json({ success: false, message: "Email and password must be text" });
+    }
 
     // Explicitly select password since it's `select: false` in schema
     const user = await User.findOne({ email: email.toLowerCase().trim() }).select("+password");
 
     if (!user) {
+      shieldops.security.loginFailed({ account: email, ip: req.ip, status: 401 });
       return res.status(401).json({ success: false, message: "Invalid email or password" });
     }
 
     if (user.status === "inactive") {
+      shieldops.security.loginFailed({ account: email, userId: String(user._id), ip: req.ip, status: 403 });
       return res.status(403).json({ success: false, message: "Account is deactivated. Contact admin." });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
+      shieldops.security.loginFailed({ account: email, userId: String(user._id), ip: req.ip, status: 401 });
       return res.status(401).json({ success: false, message: "Invalid email or password" });
     }
+
+    shieldops.security.loginSucceeded({ account: email, userId: String(user._id), ip: req.ip });
 
     const userObj = user.toObject();
     delete userObj.password;

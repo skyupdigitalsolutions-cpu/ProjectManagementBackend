@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 const helmet   = require('helmet');
 const morgan   = require('morgan');
 require('dotenv').config();
+// ShieldOps monitoring (API performance, errors, logins, logs). Loaded right after .env.
+const shieldops = require('./config/shieldops');
 
 // ─── Crash guards ─────────────────────────────────────────────────────────────
 // A single uncaught error (e.g. an IMAP socket 'error' event with no listener,
@@ -10,6 +12,7 @@ require('dotenv').config();
 // every user. Log it loudly so it appears in the host logs, and keep serving.
 // This also turns silent process deaths into a readable stack trace you can act
 // on. (A truly fatal state will still surface; the host can restart if needed.)
+// Both are also reported to ShieldOps, because console.error is forwarded there.
 process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION:', reason);
 });
@@ -26,6 +29,13 @@ const {
 } = require('./controllers/EsslController');
 
 const app = express();
+
+// ─── Real visitor IP ─────────────────────────────────────────────────────────
+// Render (and nginx on a VPS) sit in front of the app. Trusting that one proxy
+// makes req.ip the visitor's real address instead of the proxy's, so rate limits
+// and ShieldOps' brute-force detection see each visitor separately. Set
+// TRUST_PROXY=2 if another proxy (such as Cloudflare's orange cloud) is added.
+app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 
 // ─── Path normalisation (MUST be the very first middleware) ───────────────────
 // eSSL / ZKTeco firmware appends its hardcoded "/iclock/..." path to whatever is
@@ -51,6 +61,12 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// ─── ShieldOps request tracking ──────────────────────────────────────────────
+// Times every request and records its route (API performance page). Placed right
+// after path normalisation so device paths are already tidy, and before CORS so
+// preflight timings are included too.
+app.use(shieldops.requestHandler());
 
 // ─── CORS (explicit, proxy-proof) ─────────────────────────────────────────────
 // Registered FIRST so the OPTIONS preflight is answered before helmet / routes
@@ -137,19 +153,24 @@ app.get('/', (req, res) => {
 app.get('/ping', (req, res) => res.send('pong'));
 
 // ─── Seed Admin ───────────────────────────────────────────────────────────────
-app.get('/seed-admin', async (req, res) => {
-  try {
-    const bcrypt = require('bcryptjs');
-    const User   = require('./models/users');
-    const existing = await User.findOne({ email: 'admin@company.com' });
-    if (existing) return res.json({ message: 'Admin already exists' });
-    const password = await bcrypt.hash('admin123', await bcrypt.genSalt(10));
-    await User.create({ name: 'Admin', email: 'admin@company.com', password, role: 'admin', status: 'active', department: 'Administration', designation: 'System Administrator' });
-    res.json({ message: '✅ Admin created! Email: admin@company.com / Password: admin123' });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
+// Creates an admin with a KNOWN password, so it is OFF unless ENABLE_SEED_ADMIN=true
+// is set. Turn it on only for a first setup, then remove the variable again.
+// Never leave it on in production: anyone could open the URL.
+if (process.env.ENABLE_SEED_ADMIN === 'true') {
+  app.get('/seed-admin', async (req, res) => {
+    try {
+      const bcrypt = require('bcryptjs');
+      const User   = require('./models/users');
+      const existing = await User.findOne({ email: 'admin@company.com' });
+      if (existing) return res.json({ message: 'Admin already exists' });
+      const password = await bcrypt.hash('admin123', await bcrypt.genSalt(10));
+      await User.create({ name: 'Admin', email: 'admin@company.com', password, role: 'admin', status: 'active', department: 'Administration', designation: 'System Administrator' });
+      res.json({ message: '✅ Admin created! Email: admin@company.com / Password: admin123' });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+}
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
 // FIX: excelTemplateRoutes must be mounted BEFORE app.use('/api', routes)
@@ -162,6 +183,11 @@ app.use('/api', routes);
 app.use((req, res) => {
   res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
 });
+
+// ─── ShieldOps error capture ─────────────────────────────────────────────────
+// After all routes: reports errors passed to next(err) to ShieldOps (Errors page),
+// then hands them on to the global error handler below unchanged.
+app.use(shieldops.errorHandler());
 
 // ─── Global Error Handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
