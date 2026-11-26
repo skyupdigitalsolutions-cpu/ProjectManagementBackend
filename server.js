@@ -76,7 +76,7 @@ app.use(shieldops.requestHandler());
 // to allow any origin (note: "*" cannot be combined with credentials per spec).
 const ALLOWED_ORIGINS = (
   process.env.CORS_ORIGINS ||
-  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com'
+  'https://skyupprojectmanagement.com,https://www.skyupprojectmanagement.com,https://attendance-app.skyupdigitalsolutions.workers.dev'
 )
   .split(',')
   .map((s) => s.trim())
